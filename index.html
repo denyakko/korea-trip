@@ -459,6 +459,23 @@ function fmtDateWithWeekday(dateStr) {
   return `${dateStr.slice(5)}(${WEEKDAYS_JA[d.getDay()]})`;
 }
 
+// 「[NAVER マップ] 店名 住所 https://...」のように余分な文字が混ざった状態で貼り付けられても、
+// URL部分だけを自動で抜き出す（Google/NAVERマップアプリの「コピー」機能対策）
+function extractUrl(text) {
+  if (!text) return text;
+  const match = text.match(/https?:\/\/\S+/);
+  return match ? match[0] : text;
+}
+function onPasteExtractUrl(onChange) {
+  return (e) => {
+    const pasted = e.clipboardData?.getData("text");
+    if (pasted && /https?:\/\//.test(pasted)) {
+      e.preventDefault();
+      onChange(extractUrl(pasted));
+    }
+  };
+}
+
 function krwToJpy(krw, rate) {
   const n = parseFloat(krw) || 0;
   return (n / 1000) * (parseFloat(rate) || 0);
@@ -1214,6 +1231,52 @@ function weatherEmoji(code) {
   return WEATHER_ICONS[code] || "🌡️";
 }
 
+// カウントダウンの日数に応じて関西弁でコメントするキャラ
+const COUNTDOWN_COMMENTS = {
+  far: ["まだまだ先やなぁ。のんびり準備しよか", "気ぃ早いけど、もう待ちきれへんわ〜"],
+  month: ["あと1ヶ月ちょいか〜。ぼちぼち準備始めよか", "そろそろ実感わいてきたんちゃう？"],
+  twoWeeks: ["2週間〜1ヶ月前やな。持ち物リスト見直しときや", "そろそろ計画詰めていこか"],
+  week: ["1週間ちょいやん！準備の追い込み時期やで", "そろそろソワソワしてきた頃ちゃう？"],
+  soon: ["もうすぐやん〜！忘れ物ないか？", "今週入ったらあっちゅう間やで"],
+  tomorrow: ["明日やん！！ちゃんと寝ときや", "いよいよ明日か〜！忘れ物チェックした？"],
+  during: ["今頃楽しんでるんちゃう〜？", "忘れ物より、今の思い出楽しみや！"],
+  after: ["おかえり〜！ええ旅やった？", "また来年、行こな"],
+  unset: ["日程、まだ決まってへんな。早めに決めよか〜"],
+};
+function pickComment(phase, dday) {
+  let bucket;
+  if (phase === "during") bucket = "during";
+  else if (phase === "after") bucket = "after";
+  else if (phase === "unset") bucket = "unset";
+  else if (dday === 0 || dday === 1) bucket = "tomorrow";
+  else if (dday <= 7) bucket = "soon";
+  else if (dday <= 14) bucket = "week";
+  else if (dday <= 30) bucket = "twoWeeks";
+  else if (dday <= 60) bucket = "month";
+  else bucket = "far";
+  const options = COUNTDOWN_COMMENTS[bucket];
+  return options[Math.floor(Math.random() * options.length)];
+}
+function CharacterComment({ phase, dday }) {
+  const comment = React.useMemo(() => pickComment(phase, dday), [phase, dday]);
+  return (
+    <div className="flex items-start gap-2 px-1">
+      <div
+        className="w-9 h-9 rounded-full flex items-center justify-center text-lg shrink-0"
+        style={{ background: C.cream, border: `1px solid ${C.line}` }}
+      >
+        🐯
+      </div>
+      <div
+        className="rounded-2xl rounded-tl-sm px-3 py-2 text-sm relative"
+        style={{ background: C.paper, color: C.ink, border: `1px solid ${C.line}` }}
+      >
+        {comment}
+      </div>
+    </div>
+  );
+}
+
 function WeatherForecast({ first, last }) {
   const [data, setData] = useState(null);
   const [state, setState] = useState("idle"); // idle | loading | ok | error | toofar
@@ -1588,6 +1651,8 @@ function Home({ trip, year, setTab, save, prevReflection, myId, onSelectMe, onOp
         )}
       </div>
 
+      <CharacterComment phase={phase} dday={dday} />
+
       <WeatherForecast first={first} last={last} />
 
       {/* Progress rings */}
@@ -1818,11 +1883,9 @@ function Registration({ trip, save }) {
   const setMemberMotto = (id, motto) => {
     save({ ...trip, members: trip.members.map((m) => (m.id === id ? { ...m, motto } : m)) });
   };
-  const update = (memberId, patch) => {
-    const newTravel = { ...(trip.travel[memberId] || {}), ...patch };
-    const member = trip.members.find((m) => m.id === memberId);
-    let schedule = trip.schedule;
-
+  // 1人分のtravelデータから、フライト由来の自動スケジュールを計算する（scheduleに反映した新しい配列を返す）
+  const syncFlightSchedule = (baseSchedule, memberId, travelData, memberObj) => {
+    let schedule = baseSchedule;
     const upsertOrRemove = (id, condition, itemFields) => {
       if (condition) {
         const idx = schedule.findIndex((s) => s.id === id);
@@ -1835,62 +1898,76 @@ function Registration({ trip, save }) {
         schedule = schedule.filter((s) => s.id !== id);
       }
     };
-
-    // 往路の出発 → スケジュールに自動反映
     upsertOrRemove(
       `flight-out-depart-${memberId}`,
-      newTravel.startDate && newTravel.flightOutDepart,
+      travelData.startDate && travelData.flightOutDepart,
       {
-        date: newTravel.startDate,
-        time: newTravel.flightOutDepart,
-        title: `${member?.name || ""} 韓国へ出発！`,
-        note: newTravel.flightOutNo ? `便名: ${newTravel.flightOutNo}` : "",
+        date: travelData.startDate,
+        time: travelData.flightOutDepart,
+        title: `${memberObj?.name || ""} 韓国へ出発！`,
+        note: travelData.flightOutNo ? `便名: ${travelData.flightOutNo}` : "",
         auto: true,
       }
     );
-    // 往路の到着 → スケジュールに自動反映
     upsertOrRemove(
       `flight-out-${memberId}`,
-      newTravel.startDate && newTravel.flightOutArrive,
+      travelData.startDate && travelData.flightOutArrive,
       {
-        date: newTravel.startDate,
-        time: newTravel.flightOutArrive,
-        title: `✈️ ${member?.name || ""} 到着`,
-        note: newTravel.flightOutNo ? `便名: ${newTravel.flightOutNo}` : "",
+        date: travelData.startDate,
+        time: travelData.flightOutArrive,
+        title: `✈️ ${memberObj?.name || ""} 到着`,
+        note: travelData.flightOutNo ? `便名: ${travelData.flightOutNo}` : "",
         auto: true,
       }
     );
-    // 復路の出発 → スケジュールに自動反映
     upsertOrRemove(
       `flight-in-${memberId}`,
-      newTravel.endDate && newTravel.flightInDepart,
+      travelData.endDate && travelData.flightInDepart,
       {
-        date: newTravel.endDate,
-        time: newTravel.flightInDepart,
-        title: `✈️ ${member?.name || ""} 出発（帰国）`,
-        note: newTravel.flightInNo ? `便名: ${newTravel.flightInNo}` : "",
+        date: travelData.endDate,
+        time: travelData.flightInDepart,
+        title: `✈️ ${memberObj?.name || ""} 出発（帰国）`,
+        note: travelData.flightInNo ? `便名: ${travelData.flightInNo}` : "",
         auto: true,
       }
     );
-    // 帰りの最終到着 → スケジュールに自動反映
     upsertOrRemove(
       `flight-in-arrive-${memberId}`,
-      newTravel.endDate && newTravel.flightInArrive,
+      travelData.endDate && travelData.flightInArrive,
       {
-        date: newTravel.endDate,
-        time: newTravel.flightInArrive,
-        title: `${member?.name || ""} 日本着 またね！`,
-        note: newTravel.flightInNo ? `便名: ${newTravel.flightInNo}` : "",
+        date: travelData.endDate,
+        time: travelData.flightInArrive,
+        title: `${memberObj?.name || ""} 日本着 またね！`,
+        note: travelData.flightInNo ? `便名: ${travelData.flightInNo}` : "",
         auto: true,
       }
     );
+    return schedule;
+  };
 
+  const update = (memberId, patch) => {
+    const newTravel = { ...(trip.travel[memberId] || {}), ...patch };
+    const member = trip.members.find((m) => m.id === memberId);
+    const schedule = syncFlightSchedule(trip.schedule, memberId, newTravel, member);
     save({
       ...trip,
       travel: { ...trip.travel, [memberId]: newTravel },
       schedule,
     });
   };
+
+  // タブを開いた時点で、全員分のフライト自動スケジュールに漏れがないかチェックして補う
+  useEffect(() => {
+    let schedule = trip.schedule;
+    trip.members.forEach((m) => {
+      const t = trip.travel[m.id] || {};
+      schedule = syncFlightSchedule(schedule, m.id, t, m);
+    });
+    if (JSON.stringify(schedule) !== JSON.stringify(trip.schedule)) {
+      save({ ...trip, schedule });
+    }
+    // eslint-disable-next-line
+  }, [trip.members.length]);
 
   return (
     <div className="space-y-4">
@@ -2241,6 +2318,7 @@ function HotelTab({ trip, save }) {
               placeholder="https://..."
               value={h.mapLink}
               onChange={(e) => update(h.id, { mapLink: e.target.value })}
+              onPaste={onPasteExtractUrl((v) => update(h.id, { mapLink: v }))}
             />
           </Field>
           {h.mapLink && (
@@ -2259,6 +2337,7 @@ function HotelTab({ trip, save }) {
               placeholder="https://..."
               value={h.bookingLink || ""}
               onChange={(e) => update(h.id, { bookingLink: e.target.value })}
+              onPaste={onPasteExtractUrl((v) => update(h.id, { bookingLink: v }))}
             />
           </Field>
           {h.bookingLink && (
@@ -2269,7 +2348,7 @@ function HotelTab({ trip, save }) {
               className="inline-flex items-center gap-1 text-xs font-medium mb-2 -mt-1"
               style={{ color: C.persimmon }}
             >
-              予約ページを開く <ExternalLink size={12} />
+              ページを開く <ExternalLink size={12} />
             </a>
           )}
             </>
@@ -2624,11 +2703,13 @@ function ScheduleTab({ trip, save, myId }) {
               placeholder="地図リンク（Google）"
               value={draft.mapLinkGoogle}
               onChange={(e) => patchDraft({ mapLinkGoogle: e.target.value })}
+              onPaste={onPasteExtractUrl((v) => patchDraft({ mapLinkGoogle: v }))}
             />
             <TextInput
               placeholder="地図リンク（NAVER）"
               value={draft.mapLinkNaver}
               onChange={(e) => patchDraft({ mapLinkNaver: e.target.value })}
+              onPaste={onPasteExtractUrl((v) => patchDraft({ mapLinkNaver: v }))}
             />
           </div>
           <TextInput
@@ -2809,11 +2890,13 @@ function ScheduleTab({ trip, save, myId }) {
                 placeholder="地図リンク（Google）"
                 value={s.mapLinkGoogle || ""}
                 onChange={(e) => update(s.id, { mapLinkGoogle: e.target.value })}
+                onPaste={onPasteExtractUrl((v) => update(s.id, { mapLinkGoogle: v }))}
               />
               <TextInput
                 placeholder="地図リンク（NAVER）"
                 value={s.mapLinkNaver || ""}
                 onChange={(e) => update(s.id, { mapLinkNaver: e.target.value })}
+                onPaste={onPasteExtractUrl((v) => update(s.id, { mapLinkNaver: v }))}
               />
             </div>
             {(s.mapLinkGoogle || s.mapLinkNaver) && (
@@ -3136,32 +3219,62 @@ function Money({ trip, save, myId, initialView, setTab }) {
                 }
                 return (
                   <div className="space-y-2.5">
-                    {settlements.map((s, i) => (
-                      <div
-                        key={i}
-                        className="flex items-center gap-2 text-sm rounded-xl px-3 py-2.5"
-                        style={{ background: C.cream }}
-                      >
-                        <span className="font-medium" style={{ color: C.ink }}>
-                          {s.from.emoji || "😀"} {s.from.name}
-                        </span>
-                        <span style={{ color: C.inkSoft }}>→</span>
-                        <span className="font-medium" style={{ color: C.ink }}>
-                          {s.to.emoji || "😀"} {s.to.name}
-                        </span>
-                        <span
-                          className="ml-auto font-bold"
-                          style={{ color: C.persimmon, fontFamily: "'Quicksand', monospace" }}
+                    {settlements.map((s, i) => {
+                      const key = `${s.from.id}_${s.to.id}`;
+                      const done = !!(trip.settledPairs || {})[key];
+                      return (
+                        <div
+                          key={i}
+                          className="flex items-center gap-2 text-sm rounded-xl px-3 py-2.5"
+                          style={{ background: done ? C.cream : C.cream, opacity: done ? 0.55 : 1 }}
                         >
-                          {yen(s.amount)}
-                        </span>
-                      </div>
-                    ))}
+                          <button
+                            onClick={() =>
+                              save({
+                                ...trip,
+                                settledPairs: { ...(trip.settledPairs || {}), [key]: !done },
+                              })
+                            }
+                            className="w-6 h-6 rounded-full flex items-center justify-center shrink-0"
+                            style={{
+                              background: done ? C.teal : "white",
+                              border: `1px solid ${done ? C.teal : C.line}`,
+                            }}
+                            title={done ? "未送金に戻す" : "送金済みにする"}
+                          >
+                            {done && <Check size={13} color="white" />}
+                          </button>
+                          <span
+                            className="font-medium"
+                            style={{ color: C.ink, textDecoration: done ? "line-through" : "none" }}
+                          >
+                            {s.from.emoji || "😀"} {s.from.name}
+                          </span>
+                          <span style={{ color: C.inkSoft }}>→</span>
+                          <span
+                            className="font-medium"
+                            style={{ color: C.ink, textDecoration: done ? "line-through" : "none" }}
+                          >
+                            {s.to.emoji || "😀"} {s.to.name}
+                          </span>
+                          <span
+                            className="ml-auto font-bold"
+                            style={{
+                              color: done ? C.inkSoft : C.persimmon,
+                              fontFamily: "'Quicksand', monospace",
+                              textDecoration: done ? "line-through" : "none",
+                            }}
+                          >
+                            {yen(s.amount)}
+                          </span>
+                        </div>
+                      );
+                    })}
                   </div>
                 );
               })()}
               <p className="text-[11px] mt-3" style={{ color: C.inkSoft }}>
-                送金の回数が少なくなるように自動で組み合わせています。
+                送金の回数が少なくなるように自動で組み合わせています。左の丸をタップすると「送金済み」を記録できます。
               </p>
             </Card>
           )}
@@ -3558,6 +3671,7 @@ function Wishlist({ trip, save }) {
                       placeholder="地図リンク"
                       value={p.mapLink}
                       onChange={(e) => update(m.id, p.id, { mapLink: e.target.value })}
+                      onPaste={onPasteExtractUrl((v) => update(m.id, p.id, { mapLink: v }))}
                     />
                     {p.mapLink && (
                       <a
@@ -3574,6 +3688,7 @@ function Wishlist({ trip, save }) {
                       placeholder="URL（紹介記事・予約ページなど）"
                       value={p.url || ""}
                       onChange={(e) => update(m.id, p.id, { url: e.target.value })}
+                      onPaste={onPasteExtractUrl((v) => update(m.id, p.id, { url: v }))}
                     />
                     {p.url && (
                       <a
