@@ -1461,28 +1461,6 @@ function Home({ trip, year, setTab, save, prevReflection, myId, onSelectMe, onOp
           className="hidden"
         />
         <div className="absolute right-3 top-3 z-10 flex items-center gap-1.5">
-          {trip.heroPhoto && (
-            <div className="flex rounded-full overflow-hidden" style={{ background: "rgba(255,255,255,0.85)" }}>
-              {[
-                { v: "0%", label: "上" },
-                { v: "50%", label: "中央" },
-                { v: "100%", label: "下" },
-              ].map((p) => (
-                <button
-                  key={p.v}
-                  onClick={() => save({ ...trip, heroPhotoPosition: p.v })}
-                  className="text-[10px] px-2 py-1"
-                  style={
-                    (trip.heroPhotoPosition || "20%") === p.v
-                      ? { background: C.persimmon, color: "white", fontWeight: 700 }
-                      : { color: C.ink }
-                  }
-                >
-                  {p.label}
-                </button>
-              ))}
-            </div>
-          )}
           <label
             htmlFor={heroPhotoInputId}
             className="text-[11px] px-2.5 py-1 rounded-full inline-flex items-center gap-1 cursor-pointer"
@@ -1491,6 +1469,25 @@ function Home({ trip, year, setTab, save, prevReflection, myId, onSelectMe, onOp
             📷 {trip.heroPhoto ? "写真を変更" : "写真を追加"}
           </label>
         </div>
+        {trip.heroPhoto && (
+          <div
+            className="absolute left-3 right-3 z-10 flex items-center gap-2"
+            style={{ bottom: 8 }}
+          >
+            <span className="text-[10px]" style={{ color: "rgba(255,255,255,0.8)" }}>
+              位置
+            </span>
+            <input
+              type="range"
+              min="0"
+              max="100"
+              value={parseInt(trip.heroPhotoPosition) || 20}
+              onChange={(e) => save({ ...trip, heroPhotoPosition: `${e.target.value}%` })}
+              className="flex-1"
+              style={{ accentColor: C.gold, height: 18 }}
+            />
+          </div>
+        )}
         <div
           className="text-xs tracking-[0.2em] mb-1 relative"
           style={{ color: C.gold, fontFamily: "'Quicksand', monospace" }}
@@ -2050,19 +2047,24 @@ function datesBetween(start, end) {
 
 // ---------- Hotel ----------
 function HotelTab({ trip, save }) {
-  const addHotel = () => {
+  const addHotel = (copyFrom) => {
+    const base = copyFrom
+      ? {
+          name: copyFrom.name,
+          address: copyFrom.address,
+          phone: copyFrom.phone,
+          mapLink: copyFrom.mapLink,
+          bookingLink: copyFrom.bookingLink,
+          memo: copyFrom.memo,
+        }
+      : { name: "", address: "", phone: "", mapLink: "", bookingLink: "", memo: "" };
     save({
       ...trip,
       hotels: [
         ...trip.hotels,
         {
           id: uid(),
-          name: "",
-          address: "",
-          phone: "",
-          mapLink: "",
-          bookingLink: "",
-          memo: "",
+          ...base,
           checkIn: "",
           checkOut: "",
           priceKrw: "",
@@ -2078,9 +2080,8 @@ function HotelTab({ trip, save }) {
   const remove = (id) => save({ ...trip, hotels: trip.hotels.filter((h) => h.id !== id) });
 
   const toggleNightlyMember = (h, date, mid) => {
-    const current = h.nightlyMembers?.[date] ?? trip.members.map((m) => m.id);
+    const current = h.nightlyMembers?.[date] ?? []; // デフォルトは「誰も選ばれていない」
     const has = current.includes(mid);
-    if (has && current.length <= 1) return; // 宿泊メンバーを0人にはできない
     const next = has ? current.filter((x) => x !== mid) : [...current, mid];
     update(h.id, { nightlyMembers: { ...(h.nightlyMembers || {}), [date]: next } });
   };
@@ -2254,7 +2255,7 @@ function HotelTab({ trip, save }) {
               </div>
               <div className="space-y-2">
                 {nights.map((date) => {
-                  const staying = h.nightlyMembers?.[date] ?? trip.members.map((m) => m.id);
+                  const staying = h.nightlyMembers?.[date] ?? [];
                   return (
                     <div key={date} className="rounded-xl p-2" style={{ background: C.cream }}>
                       <div className="flex items-center gap-2 mb-1.5">
@@ -2309,6 +2310,15 @@ function HotelTab({ trip, save }) {
                 <Wallet size={14} /> {h.sentToSettlement ? "精算を最新の内容に更新する" : "精算に追加する"}
               </Btn>
             </div>
+          )}
+          {h.name && (
+            <button
+              onClick={() => addHotel(h)}
+              className="mt-3 text-xs inline-flex items-center gap-1"
+              style={{ color: C.inkSoft }}
+            >
+              <Plus size={12} /> 同じホテルで部屋をもう1つ追加（名前や住所を引き継ぎます）
+            </button>
           )}
         </Card>
         );
