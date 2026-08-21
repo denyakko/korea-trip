@@ -1308,6 +1308,7 @@ function Confetti() {
 }
 
 function Home({ trip, year, setTab, save, prevReflection, myId, onSelectMe, onOpenMoneyResult }) {
+  const [showPositionSlider, setShowPositionSlider] = useState(false);
   const totalJpy = trip.expenses.reduce(
     (s, e) => s + krwToJpy(e.amountKrw, e.exchangeRate || trip.exchangeRate),
     0
@@ -1461,6 +1462,19 @@ function Home({ trip, year, setTab, save, prevReflection, myId, onSelectMe, onOp
           className="hidden"
         />
         <div className="absolute right-3 top-3 z-10 flex items-center gap-1.5">
+          {trip.heroPhoto && (
+            <button
+              onClick={() => setShowPositionSlider((v) => !v)}
+              className="text-[11px] px-2.5 py-1 rounded-full inline-flex items-center gap-1"
+              style={
+                showPositionSlider
+                  ? { background: C.persimmon, color: "white", fontWeight: 600 }
+                  : { background: "rgba(255,255,255,0.85)", color: C.ink, fontWeight: 600 }
+              }
+            >
+              ↕ 位置を調整
+            </button>
+          )}
           <label
             htmlFor={heroPhotoInputId}
             className="text-[11px] px-2.5 py-1 rounded-full inline-flex items-center gap-1 cursor-pointer"
@@ -1469,7 +1483,7 @@ function Home({ trip, year, setTab, save, prevReflection, myId, onSelectMe, onOp
             📷 {trip.heroPhoto ? "写真を変更" : "写真を追加"}
           </label>
         </div>
-        {trip.heroPhoto && (
+        {trip.heroPhoto && showPositionSlider && (
           <div
             className="absolute left-3 right-3 z-10 flex items-center gap-2"
             style={{ bottom: 8 }}
@@ -2065,6 +2079,7 @@ function HotelTab({ trip, save }) {
         {
           id: uid(),
           ...base,
+          sameAs: copyFrom ? copyFrom.id : null,
           checkIn: "",
           checkOut: "",
           priceKrw: "",
@@ -2154,17 +2169,30 @@ function HotelTab({ trip, save }) {
       {trip.hotels.length === 0 && <Empty text="ホテルはまだ登録されていません" />}
       {trip.hotels.map((h) => {
         const nights = datesBetween(h.checkIn, h.checkOut);
+        const linkedHotel = h.sameAs ? trip.hotels.find((x) => x.id === h.sameAs) : null;
         return (
         <Card key={h.id}>
-          <div className="flex justify-between items-start mb-2">
-            <TextInput
-              placeholder="ホテル名"
-              value={h.name}
-              onChange={(e) => update(h.id, { name: e.target.value })}
-              className="font-medium"
-            />
-            <IconBtn danger onClick={() => remove(h.id)} title="削除" />
-          </div>
+          {linkedHotel ? (
+            <div className="flex justify-between items-start mb-2">
+              <div className="text-sm font-medium" style={{ color: C.ink }}>
+                🏨 {linkedHotel.name || "（同じホテル）"}
+                <span className="text-xs font-normal ml-1.5" style={{ color: C.inkSoft }}>
+                  の別の部屋
+                </span>
+              </div>
+              <IconBtn danger onClick={() => remove(h.id)} title="削除" />
+            </div>
+          ) : (
+            <div className="flex justify-between items-start mb-2">
+              <TextInput
+                placeholder="ホテル名"
+                value={h.name}
+                onChange={(e) => update(h.id, { name: e.target.value })}
+                className="font-medium"
+              />
+              <IconBtn danger onClick={() => remove(h.id)} title="削除" />
+            </div>
+          )}
           <div className="grid grid-cols-2 gap-3 mt-2">
             <Field label="チェックイン">
               <TextInput type="date" value={h.checkIn} onChange={(e) => update(h.id, { checkIn: e.target.value })} />
@@ -2173,6 +2201,8 @@ function HotelTab({ trip, save }) {
               <TextInput type="date" value={h.checkOut} onChange={(e) => update(h.id, { checkOut: e.target.value })} />
             </Field>
           </div>
+          {!linkedHotel && (
+            <>
           <Field label="住所">
             <TextInput
               placeholder="住所"
@@ -2247,6 +2277,22 @@ function HotelTab({ trip, save }) {
               style={{ background: "white", color: C.ink, border: `1px solid ${C.line}` }}
             />
           </Field>
+            </>
+          )}
+          {linkedHotel && (
+            <Field label={nights.length > 0 ? "この部屋の代金（合計・自動計算）" : "この部屋の代金（ウォン）"}>
+              {nights.length > 0 ? (
+                <div
+                  className="w-full rounded-lg px-3 py-2 text-sm"
+                  style={{ ...inputStyle, color: C.inkSoft, fontFamily: "'Quicksand', monospace" }}
+                >
+                  ₩{nightlyTotal(h, nights).toLocaleString()}
+                </div>
+              ) : (
+                <MoneyInput value={h.priceKrw || ""} onChange={(v) => update(h.id, { priceKrw: v })} />
+              )}
+            </Field>
+          )}
 
           {nights.length > 0 && trip.members.length > 0 && (
             <div className="mt-3">
@@ -2311,9 +2357,9 @@ function HotelTab({ trip, save }) {
               </Btn>
             </div>
           )}
-          {h.name && (
+          {(linkedHotel || h.name) && (
             <button
-              onClick={() => addHotel(h)}
+              onClick={() => addHotel(linkedHotel || h)}
               className="mt-3 text-xs inline-flex items-center gap-1"
               style={{ color: C.inkSoft }}
             >
