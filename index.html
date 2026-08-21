@@ -705,12 +705,21 @@ function App() {
   }, []);
 
   const loadTrip = async (id, tripsList = trips) => {
+    let tripData = emptyTrip();
     try {
       const res = await window.storage.get(`trip:${id}`, true);
-      setTrip(res ? JSON.parse(res.value) : emptyTrip());
+      tripData = res ? JSON.parse(res.value) : emptyTrip();
     } catch {
-      setTrip(emptyTrip());
+      tripData = emptyTrip();
     }
+    // 写真だけは別ドキュメントに保存している（Firestoreの1ドキュメント1MB制限を避けるため）
+    try {
+      const photoRes = await window.storage.get(`trip-photo:${id}`, true);
+      tripData.heroPhoto = photoRes ? photoRes.value : "";
+    } catch {
+      tripData.heroPhoto = "";
+    }
+    setTrip(tripData);
     // this device's "who am I" choice for this trip（personal, not shared with the group）
     try {
       const res = await window.storage.get(`whoAmI:${id}`, false);
@@ -741,9 +750,13 @@ function App() {
     async (nextTrip, id = tripId) => {
       setTrip(nextTrip);
       setSaveState("saving");
+      const { heroPhoto, ...rest } = nextTrip;
       try {
-        const result = await window.storage.set(`trip:${id}`, JSON.stringify(nextTrip), true);
-        setSaveState(result ? "saved" : "idle");
+        const results = await Promise.all([
+          window.storage.set(`trip:${id}`, JSON.stringify(rest), true),
+          window.storage.set(`trip-photo:${id}`, heroPhoto || "", true),
+        ]);
+        setSaveState(results.every(Boolean) ? "saved" : "idle");
         setTimeout(() => setSaveState("idle"), 1200);
       } catch (e) {
         console.error("save failed", e);
@@ -799,6 +812,11 @@ function App() {
       await window.storage.delete(`trip:${id}`, true);
     } catch (e) {
       console.error("trip data delete failed", e);
+    }
+    try {
+      await window.storage.delete(`trip-photo:${id}`, true);
+    } catch (e) {
+      // 写真が未設定だった場合は削除できなくても問題ない
     }
     if (id === tripId) {
       const next = newTrips[newTrips.length - 1];
@@ -1332,7 +1350,21 @@ function Home({ trip, year, setTab, save, prevReflection, myId, onSelectMe, onOp
     if (!file) return;
     const reader = new FileReader();
     reader.onload = () => {
-      save({ ...trip, heroPhoto: reader.result });
+      const img = new Image();
+      img.onload = () => {
+        const maxW = 1200;
+        const scale = Math.min(1, maxW / img.width);
+        const w = Math.round(img.width * scale);
+        const h = Math.round(img.height * scale);
+        const canvas = document.createElement("canvas");
+        canvas.width = w;
+        canvas.height = h;
+        const ctx = canvas.getContext("2d");
+        ctx.drawImage(img, 0, 0, w, h);
+        const compressed = canvas.toDataURL("image/jpeg", 0.7);
+        save({ ...trip, heroPhoto: compressed });
+      };
+      img.src = reader.result;
     };
     reader.readAsDataURL(file);
     e.target.value = "";
@@ -2237,7 +2269,7 @@ function HotelTab({ trip, save }) {
               className="inline-flex items-center gap-1 text-xs font-medium mb-2 -mt-1"
               style={{ color: C.persimmon }}
             >
-              ページを開く <ExternalLink size={12} />
+              予約ページを開く <ExternalLink size={12} />
             </a>
           )}
             </>
