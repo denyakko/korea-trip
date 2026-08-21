@@ -1461,7 +1461,14 @@ function Home({ trip, year, setTab, save, prevReflection, myId, onSelectMe, onOp
           onChange={handlePhotoChange}
           className="hidden"
         />
-        <div className="absolute right-3 top-3 z-10 flex items-center gap-1.5">
+        <div className="absolute right-3 top-3 z-10 flex flex-col items-end gap-1.5">
+          <label
+            htmlFor={heroPhotoInputId}
+            className="text-[11px] px-2.5 py-1 rounded-full inline-flex items-center gap-1 cursor-pointer"
+            style={{ background: "rgba(255,255,255,0.85)", color: C.ink, fontWeight: 600 }}
+          >
+            📷 {trip.heroPhoto ? "写真を変更" : "写真を追加"}
+          </label>
           {trip.heroPhoto && (
             <button
               onClick={() => setShowPositionSlider((v) => !v)}
@@ -1475,13 +1482,6 @@ function Home({ trip, year, setTab, save, prevReflection, myId, onSelectMe, onOp
               ↕ 位置を調整
             </button>
           )}
-          <label
-            htmlFor={heroPhotoInputId}
-            className="text-[11px] px-2.5 py-1 rounded-full inline-flex items-center gap-1 cursor-pointer"
-            style={{ background: "rgba(255,255,255,0.85)", color: C.ink, fontWeight: 600 }}
-          >
-            📷 {trip.heroPhoto ? "写真を変更" : "写真を追加"}
-          </label>
         </div>
         {trip.heroPhoto && showPositionSlider && (
           <div
@@ -2069,9 +2069,8 @@ function HotelTab({ trip, save }) {
           phone: copyFrom.phone,
           mapLink: copyFrom.mapLink,
           bookingLink: copyFrom.bookingLink,
-          memo: copyFrom.memo,
         }
-      : { name: "", address: "", phone: "", mapLink: "", bookingLink: "", memo: "" };
+      : { name: "", address: "", phone: "", mapLink: "", bookingLink: "" };
     save({
       ...trip,
       hotels: [
@@ -2079,12 +2078,12 @@ function HotelTab({ trip, save }) {
         {
           id: uid(),
           ...base,
+          memo: "",
           sameAs: copyFrom ? copyFrom.id : null,
           checkIn: "",
           checkOut: "",
           priceKrw: "",
-          nightlyMembers: {},
-          nightlyPrices: {},
+          roomMembers: [],
         },
       ],
     });
@@ -2094,70 +2093,42 @@ function HotelTab({ trip, save }) {
   };
   const remove = (id) => save({ ...trip, hotels: trip.hotels.filter((h) => h.id !== id) });
 
-  const toggleNightlyMember = (h, date, mid) => {
-    const current = h.nightlyMembers?.[date] ?? []; // デフォルトは「誰も選ばれていない」
+  const toggleRoomMember = (h, mid) => {
+    let current = h.roomMembers || [];
+    if (current.length === 0 && h.nightlyMembers) {
+      current = [...new Set(Object.values(h.nightlyMembers).flat())];
+    }
     const has = current.includes(mid);
     const next = has ? current.filter((x) => x !== mid) : [...current, mid];
-    update(h.id, { nightlyMembers: { ...(h.nightlyMembers || {}), [date]: next } });
+    update(h.id, { roomMembers: next });
   };
 
-  const updateNightlyPrice = (h, date, value) => {
-    update(h.id, { nightlyPrices: { ...(h.nightlyPrices || {}), [date]: value } });
-  };
-
-  const nightlyTotal = (h, nights) =>
-    nights.reduce((s, d) => s + (parseFloat(h.nightlyPrices?.[d]) || 0), 0);
-
-  const sendToSettlement = (h, nights) => {
-    // build the desired set of hotel-linked expenses from current inputs
-    let desired;
-    if (nights.length > 0) {
-      desired = nights
-        .filter((date) => (parseFloat(h.nightlyPrices?.[date]) || 0) > 0)
-        .map((date) => ({
-          hotelId: h.id,
-          hotelDate: date,
-          date,
-          description: `🏨 ${h.name || "ホテル代"}（${fmtDateWithWeekday(date)}）`,
-          amountKrw: h.nightlyPrices[date],
-          participants:
-            h.nightlyMembers?.[date] && h.nightlyMembers[date].length > 0
-              ? h.nightlyMembers[date]
-              : trip.members.map((m) => m.id),
-        }));
-    } else if (h.priceKrw) {
-      desired = [
-        {
-          hotelId: h.id,
-          hotelDate: "total",
-          date: h.checkIn || "",
-          description: `🏨 ${h.name || "ホテル代"}`,
-          amountKrw: h.priceKrw,
-          participants: trip.members.map((m) => m.id),
-        },
-      ];
-    } else {
-      desired = [];
+  const sendToSettlement = (h) => {
+    const price =
+      h.priceKrw ||
+      (h.nightlyPrices ? Object.values(h.nightlyPrices).reduce((s, v) => s + (parseFloat(v) || 0), 0) : 0);
+    if (!price) return;
+    let participants = h.roomMembers && h.roomMembers.length > 0 ? h.roomMembers : null;
+    if (!participants && h.nightlyMembers) {
+      participants = [...new Set(Object.values(h.nightlyMembers).flat())];
     }
-    if (desired.length === 0) return;
-
-    // remove any previously-linked expenses for this hotel, then re-add current ones
-    // (keeps the payer someone chose manually if one already existed for that date)
-    const keepPayer = {};
-    trip.expenses.forEach((e) => {
-      if (e.hotelId === h.id) keepPayer[e.hotelDate] = e.payerId;
-    });
+    if (!participants || participants.length === 0) participants = trip.members.map((m) => m.id);
+    const keepPayer = trip.expenses.find((e) => e.hotelId === h.id)?.payerId;
     const others = trip.expenses.filter((e) => e.hotelId !== h.id);
-    const rebuilt = desired.map((d) => ({
+    const newExpense = {
       id: uid(),
-      payerId: keepPayer[d.hotelDate] || trip.members[0]?.id || "",
-      ...d,
-    }));
-
+      hotelId: h.id,
+      hotelDate: "total",
+      date: h.checkIn || "",
+      description: `🏨 ${h.name || "ホテル代"}`,
+      amountKrw: String(price),
+      participants,
+      payerId: keepPayer || trip.members[0]?.id || "",
+    };
     save({
       ...trip,
-      hotels: trip.hotels.map((x) => (x.id === h.id ? { ...x, sentToSettlement: true } : x)),
-      expenses: [...others, ...rebuilt],
+      hotels: trip.hotels.map((x) => (x.id === h.id ? { ...x, sentToSettlement: true, priceKrw: String(price), roomMembers: participants } : x)),
+      expenses: [...others, newExpense],
     });
   };
 
@@ -2170,6 +2141,17 @@ function HotelTab({ trip, save }) {
       {trip.hotels.map((h) => {
         const nights = datesBetween(h.checkIn, h.checkOut);
         const linkedHotel = h.sameAs ? trip.hotels.find((x) => x.id === h.sameAs) : null;
+        // 旧・日割り形式で入力済みのデータがあれば、新しい形式の初期値として引き継ぐ
+        const legacyPrice =
+          !h.priceKrw && h.nightlyPrices
+            ? Object.values(h.nightlyPrices).reduce((s, v) => s + (parseFloat(v) || 0), 0)
+            : null;
+        const legacyMembers =
+          (!h.roomMembers || h.roomMembers.length === 0) && h.nightlyMembers
+            ? [...new Set(Object.values(h.nightlyMembers).flat())]
+            : null;
+        const displayPrice = h.priceKrw || (legacyPrice > 0 ? String(legacyPrice) : "");
+        const displayRoomMembers = h.roomMembers && h.roomMembers.length > 0 ? h.roomMembers : legacyMembers || [];
         return (
         <Card key={h.id}>
           {linkedHotel ? (
@@ -2201,6 +2183,11 @@ function HotelTab({ trip, save }) {
               <TextInput type="date" value={h.checkOut} onChange={(e) => update(h.id, { checkOut: e.target.value })} />
             </Field>
           </div>
+          {nights.length > 0 && (
+            <div className="text-xs mb-2" style={{ color: C.inkSoft }}>
+              {nights.length}泊
+            </div>
+          )}
           {!linkedHotel && (
             <>
           <Field label="住所">
@@ -2210,27 +2197,13 @@ function HotelTab({ trip, save }) {
               onChange={(e) => update(h.id, { address: e.target.value })}
             />
           </Field>
-          <div className="grid grid-cols-2 gap-3">
-            <Field label="電話番号">
-              <TextInput
-                placeholder="+82-..."
-                value={h.phone || ""}
-                onChange={(e) => update(h.id, { phone: e.target.value })}
-              />
-            </Field>
-            <Field label={nights.length > 0 ? "ホテル代（合計・自動計算）" : "ホテル代（合計・ウォン）"}>
-              {nights.length > 0 ? (
-                <div
-                  className="w-full rounded-lg px-3 py-2 text-sm"
-                  style={{ ...inputStyle, color: C.inkSoft, fontFamily: "'Quicksand', monospace" }}
-                >
-                  ₩{nightlyTotal(h, nights).toLocaleString()}
-                </div>
-              ) : (
-                <MoneyInput value={h.priceKrw || ""} onChange={(v) => update(h.id, { priceKrw: v })} />
-              )}
-            </Field>
-          </div>
+          <Field label="電話番号">
+            <TextInput
+              placeholder="+82-..."
+              value={h.phone || ""}
+              onChange={(e) => update(h.id, { phone: e.target.value })}
+            />
+          </Field>
           <Field label="地図リンク">
             <TextInput
               placeholder="https://..."
@@ -2267,6 +2240,40 @@ function HotelTab({ trip, save }) {
               ページを開く <ExternalLink size={12} />
             </a>
           )}
+            </>
+          )}
+
+          <Field label="この部屋の金額（合計・ウォン）">
+            <MoneyInput value={displayPrice} onChange={(v) => update(h.id, { priceKrw: v })} />
+          </Field>
+
+          {trip.members.length > 0 && (
+            <div className="mb-3">
+              <div className="text-xs font-medium mb-1.5" style={{ color: C.inkSoft }}>
+                宿泊メンバー
+              </div>
+              <div className="flex flex-wrap gap-1.5">
+                {trip.members.map((m) => {
+                  const on = displayRoomMembers.includes(m.id);
+                  return (
+                    <button
+                      key={m.id}
+                      onClick={() => toggleRoomMember(h, m.id)}
+                      className="text-xs px-2.5 py-1 rounded-full"
+                      style={
+                        on
+                          ? { background: C.persimmon, color: "white" }
+                          : { background: C.cream, color: C.inkSoft, border: `1px solid ${C.line}` }
+                      }
+                    >
+                      {m.emoji || "😀"} {m.name}
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+          )}
+
           <Field label="メモ">
             <textarea
               value={h.memo || ""}
@@ -2277,81 +2284,12 @@ function HotelTab({ trip, save }) {
               style={{ background: "white", color: C.ink, border: `1px solid ${C.line}` }}
             />
           </Field>
-            </>
-          )}
-          {linkedHotel && (
-            <Field label={nights.length > 0 ? "この部屋の代金（合計・自動計算）" : "この部屋の代金（ウォン）"}>
-              {nights.length > 0 ? (
-                <div
-                  className="w-full rounded-lg px-3 py-2 text-sm"
-                  style={{ ...inputStyle, color: C.inkSoft, fontFamily: "'Quicksand', monospace" }}
-                >
-                  ₩{nightlyTotal(h, nights).toLocaleString()}
-                </div>
-              ) : (
-                <MoneyInput value={h.priceKrw || ""} onChange={(v) => update(h.id, { priceKrw: v })} />
-              )}
-            </Field>
-          )}
 
-          {nights.length > 0 && trip.members.length > 0 && (
-            <div className="mt-3">
-              <div className="text-xs font-medium mb-2" style={{ color: C.inkSoft }}>
-                宿泊メンバーと金額（日ごと）
-              </div>
-              <div className="space-y-2">
-                {nights.map((date) => {
-                  const staying = h.nightlyMembers?.[date] ?? [];
-                  return (
-                    <div key={date} className="rounded-xl p-2" style={{ background: C.cream }}>
-                      <div className="flex items-center gap-2 mb-1.5">
-                        <span
-                          className="text-xs w-16 shrink-0"
-                          style={{ color: C.inkSoft, fontFamily: "'Quicksand', monospace" }}
-                        >
-                          {fmtDateWithWeekday(date)}
-                        </span>
-                        <div className="flex items-center gap-1 flex-1">
-                          <span className="text-xs" style={{ color: C.inkSoft }}>₩</span>
-                          <input
-                            type="text"
-                            inputMode="numeric"
-                            placeholder="0"
-                            value={h.nightlyPrices?.[date] ? Number(h.nightlyPrices[date]).toLocaleString("en-US") : ""}
-                            onChange={(e) => updateNightlyPrice(h, date, e.target.value.replace(/[^0-9]/g, ""))}
-                            className="w-24 rounded-lg px-2 py-1 text-xs outline-none"
-                            style={{ background: "white", color: C.ink, border: `1px solid ${C.line}`, fontFamily: "'Quicksand', monospace" }}
-                          />
-                        </div>
-                      </div>
-                      <div className="flex flex-wrap gap-1.5">
-                        {trip.members.map((m) => (
-                          <button
-                            key={m.id}
-                            onClick={() => toggleNightlyMember(h, date, m.id)}
-                            className="text-xs px-2 py-1 rounded-full"
-                            style={
-                              staying.includes(m.id)
-                                ? { background: C.persimmon, color: "white" }
-                                : { background: "white", color: C.inkSoft, border: `1px solid ${C.line}` }
-                            }
-                          >
-                            {m.emoji || "😀"} {m.name}
-                          </button>
-                        ))}
-                      </div>
-                    </div>
-                  );
-                })}
-              </div>
-            </div>
-          )}
-
-          {(nights.length > 0 ? nightlyTotal(h, nights) > 0 : h.priceKrw) && (
+          {displayPrice && (
             <div className="mt-3">
               <Btn
                 variant="ghost"
-                onClick={() => sendToSettlement(h, nights)}
+                onClick={() => sendToSettlement(h)}
               >
                 <Wallet size={14} /> {h.sentToSettlement ? "精算を最新の内容に更新する" : "精算に追加する"}
               </Btn>
