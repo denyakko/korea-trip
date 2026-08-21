@@ -1442,7 +1442,7 @@ function Home({ trip, year, setTab, save, prevReflection, myId, onSelectMe, onOp
         className="rounded-3xl p-5 relative overflow-hidden"
         style={{
           background: trip.heroPhoto
-            ? `linear-gradient(180deg, rgba(30,20,15,0.15), rgba(30,20,15,0.75)), url(${trip.heroPhoto}) center/cover no-repeat`
+            ? `linear-gradient(180deg, rgba(30,20,15,0.15), rgba(30,20,15,0.75)), url(${trip.heroPhoto}) center ${trip.heroPhotoPosition || "20%"}/cover no-repeat`
             : `linear-gradient(135deg, ${C.night}, #5A4536)`,
           minHeight: 168,
         }}
@@ -1460,13 +1460,37 @@ function Home({ trip, year, setTab, save, prevReflection, myId, onSelectMe, onOp
           onChange={handlePhotoChange}
           className="hidden"
         />
-        <label
-          htmlFor={heroPhotoInputId}
-          className="absolute right-3 top-3 z-10 text-[11px] px-2.5 py-1 rounded-full inline-flex items-center gap-1 cursor-pointer"
-          style={{ background: "rgba(255,255,255,0.85)", color: C.ink, fontWeight: 600 }}
-        >
-          📷 {trip.heroPhoto ? "写真を変更" : "写真を追加"}
-        </label>
+        <div className="absolute right-3 top-3 z-10 flex items-center gap-1.5">
+          {trip.heroPhoto && (
+            <div className="flex rounded-full overflow-hidden" style={{ background: "rgba(255,255,255,0.85)" }}>
+              {[
+                { v: "0%", label: "上" },
+                { v: "50%", label: "中央" },
+                { v: "100%", label: "下" },
+              ].map((p) => (
+                <button
+                  key={p.v}
+                  onClick={() => save({ ...trip, heroPhotoPosition: p.v })}
+                  className="text-[10px] px-2 py-1"
+                  style={
+                    (trip.heroPhotoPosition || "20%") === p.v
+                      ? { background: C.persimmon, color: "white", fontWeight: 700 }
+                      : { color: C.ink }
+                  }
+                >
+                  {p.label}
+                </button>
+              ))}
+            </div>
+          )}
+          <label
+            htmlFor={heroPhotoInputId}
+            className="text-[11px] px-2.5 py-1 rounded-full inline-flex items-center gap-1 cursor-pointer"
+            style={{ background: "rgba(255,255,255,0.85)", color: C.ink, fontWeight: 600 }}
+          >
+            📷 {trip.heroPhoto ? "写真を変更" : "写真を追加"}
+          </label>
+        </div>
         <div
           className="text-xs tracking-[0.2em] mb-1 relative"
           style={{ color: C.gold, fontFamily: "'Quicksand', monospace" }}
