@@ -1,0 +1,3995 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>韓国行きませんか？</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+
+<!-- Firebase (compat SDK: ビルド不要でそのままscriptタグから使える版) -->
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-auth-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore-compat.js"></script>
+</head>
+<body>
+<div id="root"></div>
+
+<script>
+// ============================================================
+// Firebase連携レイヤー（韓国旅行アプリ用）
+// ・Googleログイン
+// ・招待リンクでのグループ参加／新規作成
+// ・window.storage と同じ形のAPIをFirestoreで実装
+//   → アプリ本体（korea-trip-planner.jsx）のコードは
+//     window.storage.get / set / delete の呼び出しを
+//     一切書き換えずにそのまま動く
+// ============================================================
+
+const firebaseConfig = {
+  apiKey: "AIzaSyDzp0Qic-QYPSj-1BuVvQIG66Y3vjohV1M",
+  authDomain: "korea-trip-app.firebaseapp.com",
+  projectId: "korea-trip-app",
+  storageBucket: "korea-trip-app.firebasestorage.app",
+  messagingSenderId: "1063870267427",
+  appId: "1:1063870267427:web:b511351490054bbd423196",
+};
+
+firebase.initializeApp(firebaseConfig);
+const auth = firebase.auth();
+const db = firebase.firestore();
+
+// 現在ログイン中のユーザーと、所属グループのID
+let CURRENT_UID = null;
+let CURRENT_GROUP_ID = null;
+
+function docRefFor(key, shared) {
+  if (!CURRENT_GROUP_ID) throw new Error("no group joined yet");
+  if (shared) {
+    return db.collection("groups").doc(CURRENT_GROUP_ID).collection("shared").doc(key);
+  }
+  return db
+    .collection("groups")
+    .doc(CURRENT_GROUP_ID)
+    .collection("users")
+    .doc(CURRENT_UID)
+    .collection("personal")
+    .doc(key);
+}
+
+// window.storage と同じ見た目のAPI（get/set/delete）をFirestoreで実装
+window.storage = {
+  async get(key, shared) {
+    const snap = await docRefFor(key, shared).get();
+    if (!snap.exists) {
+      throw new Error("key not found: " + key);
+    }
+    const data = snap.data();
+    return { key, value: data.value, shared: !!shared };
+  },
+
+  async set(key, value, shared) {
+    await docRefFor(key, shared).set({
+      value,
+      updatedAt: firebase.firestore.FieldValue.serverTimestamp(),
+      updatedBy: CURRENT_UID,
+    });
+    return { key, value, shared: !!shared };
+  },
+
+  async delete(key, shared) {
+    await docRefFor(key, shared).delete();
+    return { key, deleted: true, shared: !!shared };
+  },
+};
+
+// ------------------------------------------------------------
+// グループの作成／参加
+// ------------------------------------------------------------
+
+// 招待リンクは ?g=<グループID> の形。これを読み取る
+function getInviteGroupIdFromUrl() {
+  const params = new URLSearchParams(window.location.search);
+  return params.get("g");
+}
+
+// このユーザーが既にどこかのグループに所属しているか調べる
+async function findMyGroupId(uid) {
+  const doc = await db.collection("users").doc(uid).get();
+  if (doc.exists) return doc.data().groupId || null;
+  return null;
+}
+
+// 招待リンク経由でグループに参加する（初参加の記録を書き込む）
+async function joinGroup(uid, email, groupId) {
+  await db.collection("users").doc(uid).set({ groupId, email }, { merge: true });
+  await db
+    .collection("groups")
+    .doc(groupId)
+    .set(
+      {
+        members: firebase.firestore.FieldValue.arrayUnion({ uid, email }),
+      },
+      { merge: true }
+    );
+}
+
+// 新しいグループを作る（一番最初にアプリを使う人向け）
+async function createGroup(uid, email) {
+  const ref = db.collection("groups").doc(); // 自動採番ID
+  await ref.set({
+    createdAt: firebase.firestore.FieldValue.serverTimestamp(),
+    createdBy: uid,
+    members: [{ uid, email }],
+  });
+  await db.collection("users").doc(uid).set({ groupId: ref.id, email }, { merge: true });
+  return ref.id;
+}
+
+</script>
+
+<script type="text/babel" data-presets="react">
+// ============================================================
+// lucide-react の代わりに使う、軽量な自作アイコンセット
+// （CDN配信・ビルド不要の構成では lucide-react が使えないため）
+// 呼び出し方は同じ: <Plane size={16} color="#000" />
+// ============================================================
+
+function makeIcon(paths) {
+  return function Icon({ size = 20, color = "currentColor", className = "", style = {} }) {
+    return (
+      <svg
+        width={size}
+        height={size}
+        viewBox="0 0 24 24"
+        fill="none"
+        stroke={color}
+        strokeWidth="2"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+        className={className}
+        style={style}
+      >
+        {paths}
+      </svg>
+    );
+  };
+}
+
+const Plane = makeIcon(
+  <path d="M17.8 19.2 16 11l3.5-3.5C21 6 21.5 4 21 3c-1-.5-3 0-4.5 1.5L13 8 4.8 6.2c-.5-.1-1 .1-1.3.5l-.7.9c-.4.4-.2 1.1.3 1.3L9 12l-2 3H4l-1 1.5L6 18l1.5 3 1.5-1v-3l3-2 3.6 6.5c.2.5.9.6 1.3.3l.9-.7c.4-.3.6-.8.5-1.3Z" />
+);
+const Users = makeIcon(
+  <>
+    <path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2" />
+    <circle cx="9" cy="7" r="4" />
+    <path d="M23 21v-2a4 4 0 0 0-3-3.87" />
+    <path d="M16 3.13a4 4 0 0 1 0 7.75" />
+  </>
+);
+const Hotel = makeIcon(
+  <>
+    <path d="M2 22V4a2 2 0 0 1 2-2h8a2 2 0 0 1 2 2v18" />
+    <path d="M22 22V10a2 2 0 0 0-2-2h-2" />
+    <path d="M6 6h.01M6 10h.01M6 14h.01M10 6h.01M10 10h.01M10 14h.01" />
+    <path d="M2 22h20" />
+  </>
+);
+const CalendarDays = makeIcon(
+  <>
+    <rect x="3" y="4" width="18" height="18" rx="2" />
+    <path d="M16 2v4M8 2v4M3 10h18" />
+    <path d="M8 14h.01M12 14h.01M16 14h.01M8 18h.01M12 18h.01" />
+  </>
+);
+const Wallet = makeIcon(
+  <>
+    <path d="M21 12V7a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v10a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-5" />
+    <path d="M17 12a2 2 0 1 0 0 4 2 2 0 0 0 0-4Z" />
+  </>
+);
+const MapPin = makeIcon(
+  <>
+    <path d="M20 10c0 6-8 12-8 12s-8-6-8-12a8 8 0 0 1 16 0Z" />
+    <circle cx="12" cy="10" r="3" />
+  </>
+);
+const Package = makeIcon(
+  <>
+    <path d="m16.5 9.4-9-5.19" />
+    <path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16Z" />
+    <path d="m3.3 7 8.7 5 8.7-5M12 22V12" />
+  </>
+);
+const Plus = makeIcon(<path d="M12 5v14M5 12h14" />);
+const Trash2 = makeIcon(
+  <>
+    <path d="M3 6h18M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2m3 0-1 14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2L4 6" />
+    <path d="M10 11v6M14 11v6" />
+  </>
+);
+const ExternalLink = makeIcon(
+  <>
+    <path d="M15 3h6v6M10 14 21 3M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6" />
+  </>
+);
+const ChevronDown = makeIcon(<path d="m6 9 6 6 6-6" />);
+const X = makeIcon(<path d="M18 6 6 18M6 6l12 12" />);
+const Check = makeIcon(<path d="M20 6 9 17l-5-5" />);
+const Loader2 = makeIcon(<path d="M21 12a9 9 0 1 1-6.219-8.56" />);
+const Settings = makeIcon(
+  <>
+    <circle cx="12" cy="12" r="3" />
+    <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1Z" />
+  </>
+);
+const Star = makeIcon(
+  <path d="m12 2 3.09 6.26L22 9.27l-5 4.87 1.18 6.88L12 17.77l-6.18 3.25L7 14.14 2 9.27l6.91-1.01Z" />
+);
+const ShoppingBag = makeIcon(
+  <>
+    <path d="M6 2 3 6v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2V6l-3-4Z" />
+    <path d="M3 6h18M16 10a4 4 0 0 1-8 0" />
+  </>
+);
+
+
+// ============================================================
+// AuthGate: ログイン → グループ参加 が終わってから
+// 中身（旅行アプリ本体）を表示するコンポーネント
+// ============================================================
+
+function AuthGate({ children }) {
+  const [status, setStatus] = React.useState("checking"); // checking | login | needsGroup | ready | error
+  const [user, setUser] = React.useState(null);
+  const [errorMsg, setErrorMsg] = React.useState("");
+  const [creatingGroup, setCreatingGroup] = React.useState(false);
+
+  React.useEffect(() => {
+    // リダイレクトログインから戻ってきた場合の結果を先に処理
+    auth
+      .getRedirectResult()
+      .catch((e) => {
+        console.error("redirect login failed", e);
+        setErrorMsg("ログインに失敗しました。もう一度お試しください。");
+      })
+      .finally(() => {
+        const unsub = auth.onAuthStateChanged(async (u) => {
+          if (!u) {
+            setUser(null);
+            setStatus("login");
+            return;
+          }
+          setUser(u);
+          CURRENT_UID = u.uid;
+          try {
+            let groupId = await findMyGroupId(u.uid);
+            const inviteId = getInviteGroupIdFromUrl();
+            if (!groupId && inviteId) {
+              await joinGroup(u.uid, u.email, inviteId);
+              groupId = inviteId;
+            }
+            if (!groupId) {
+              setStatus("needsGroup");
+              return;
+            }
+            CURRENT_GROUP_ID = groupId;
+            setStatus("ready");
+          } catch (e) {
+            console.error(e);
+            setErrorMsg("グループ情報の読み込みに失敗しました。");
+            setStatus("error");
+          }
+        });
+        return unsub;
+      });
+  }, []);
+
+  const handleLogin = () => {
+    const provider = new firebase.auth.GoogleAuthProvider();
+    auth.signInWithRedirect(provider);
+  };
+
+  const handleCreateGroup = async () => {
+    setCreatingGroup(true);
+    try {
+      const groupId = await createGroup(user.uid, user.email);
+      CURRENT_GROUP_ID = groupId;
+      setStatus("ready");
+    } catch (e) {
+      console.error(e);
+      setErrorMsg("グループの作成に失敗しました。");
+    } finally {
+      setCreatingGroup(false);
+    }
+  };
+
+  const inviteLink =
+    CURRENT_GROUP_ID
+      ? `${window.location.origin}${window.location.pathname}?g=${CURRENT_GROUP_ID}`
+      : "";
+
+  const shell = (content) => (
+    <div
+      className="min-h-screen flex items-center justify-center px-6"
+      style={{ background: "#FBF2E6" }}
+    >
+      <div className="max-w-sm w-full text-center">{content}</div>
+    </div>
+  );
+
+  if (status === "checking") {
+    return shell(<p style={{ color: "#A48E7C" }}>読み込み中…</p>);
+  }
+
+  if (status === "error") {
+    return shell(<p style={{ color: "#DD8E98" }}>{errorMsg}</p>);
+  }
+
+  if (status === "login") {
+    return shell(
+      <>
+        <h1 className="text-xl font-bold mb-2" style={{ color: "#5C4535" }}>
+          韓国行きませんか？
+        </h1>
+        <p className="text-sm mb-6" style={{ color: "#A48E7C" }}>
+          旅の情報をみんなで共有するには、Googleアカウントでログインしてください
+        </p>
+        {errorMsg && (
+          <p className="text-xs mb-3" style={{ color: "#DD8E98" }}>
+            {errorMsg}
+          </p>
+        )}
+        <button
+          onClick={handleLogin}
+          className="px-5 py-2.5 rounded-full text-sm font-medium"
+          style={{ background: "#DD8E98", color: "white" }}
+        >
+          Googleでログイン
+        </button>
+      </>
+    );
+  }
+
+  if (status === "needsGroup") {
+    return shell(
+      <>
+        <h1 className="text-lg font-bold mb-2" style={{ color: "#5C4535" }}>
+          まだどのグループにも参加していません
+        </h1>
+        <p className="text-sm mb-6" style={{ color: "#A48E7C" }}>
+          仲間から届いた招待リンクを開いてログインすると、自動でそのグループに参加します。
+          <br />
+          まだ誰も旅を始めていない場合は、あなたが新しくグループを作れます。
+        </p>
+        {errorMsg && (
+          <p className="text-xs mb-3" style={{ color: "#DD8E98" }}>
+            {errorMsg}
+          </p>
+        )}
+        <button
+          onClick={handleCreateGroup}
+          disabled={creatingGroup}
+          className="px-5 py-2.5 rounded-full text-sm font-medium"
+          style={{ background: "#DD8E98", color: "white" }}
+        >
+          {creatingGroup ? "作成中…" : "新しくグループを作る"}
+        </button>
+      </>
+    );
+  }
+
+  // ready
+  return children;
+}
+
+
+const { useState, useEffect, useCallback } = React;
+
+// ---------- design tokens ----------
+const C = {
+  night: "#7C6A5B",
+  nightSoft: "#9C8A7A",
+  cream: "#F7F1E8",
+  paper: "#FFFDFA",
+  persimmon: "#D9A9A8",
+  teal: "#A7B79A",
+  gold: "#D7B285",
+  ink: "#5E4F44",
+  inkSoft: "#A5978A",
+  line: "#EAE0D0",
+};
+
+const FONTS = `
+@import url('https://fonts.googleapis.com/css2?family=M+PLUS+Rounded+1c:wght@500;700;800&family=Zen+Maru+Gothic:wght@400;500;700&family=Quicksand:wght@500;600;700&display=swap');
+`;
+
+// 一番古い登録年が何回目の旅行かの起点（今回=4回目なので4）
+const FIRST_YEAR_VOL = 4;
+const APP_TITLE = "韓国行きませんか？";
+const LOGO_DATA_URI = "data:image/webp;base64,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";
+
+const TABS = [
+  { id: "home", label: "ホーム", icon: Plane },
+  { id: "registration", label: "登録", icon: Users },
+  { id: "hotel", label: "ホテル", icon: Hotel },
+  { id: "schedule", label: "スケジュール", icon: CalendarDays },
+  { id: "money", label: "精算", icon: Wallet },
+  { id: "wishlist", label: "行きたい場所", icon: MapPin },
+  { id: "shopping", label: "買い物リスト", icon: ShoppingBag },
+  { id: "packing", label: "持ち物", icon: Package },
+  { id: "summary", label: "まとめ", icon: Star },
+];
+
+const uid = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
+
+const emptyTrip = () => ({
+  members: [],
+  travel: {},
+  hotels: [],
+  schedule: [],
+  expenses: [],
+  exchangeRate: 100, // JPY per 1000 KRW
+  wishlist: {},
+  packing: [],
+  shopping: [], // [{ id, name, url, memo, bought, addedBy }]
+  reflection: [], // [{ id, authorId, text, date }]
+  heroPhoto: "",
+  subtitle: "", // free-text subtitle shown under the app title, e.g. "vol.4" or a custom trip name // base64 dataURL of a trip photo, shown behind the home hero
+});
+
+const WEEKDAYS_JA = ["日", "月", "火", "水", "木", "金", "土"];
+function fmtDateWithWeekday(dateStr) {
+  if (!dateStr) return "";
+  const d = new Date(dateStr);
+  if (isNaN(d.getTime())) return dateStr.slice(5);
+  return `${dateStr.slice(5)}(${WEEKDAYS_JA[d.getDay()]})`;
+}
+
+function krwToJpy(krw, rate) {
+  const n = parseFloat(krw) || 0;
+  return (n / 1000) * (parseFloat(rate) || 0);
+}
+const yen = (n) => `¥${Math.round(n).toLocaleString()}`;
+
+// balances: [{ member, balance }] where balance > 0 means "should receive"
+// Returns minimal list of { from, to, amount } transactions to settle up.
+function settleDebts(balances) {
+  const EPS = 1; // ignore differences under 1 yen
+  const creditors = balances
+    .filter((b) => b.balance > EPS)
+    .map((b) => ({ member: b.member, amount: b.balance }))
+    .sort((a, b) => b.amount - a.amount);
+  const debtors = balances
+    .filter((b) => b.balance < -EPS)
+    .map((b) => ({ member: b.member, amount: -b.balance }))
+    .sort((a, b) => b.amount - a.amount);
+
+  const result = [];
+  let i = 0,
+    j = 0;
+  while (i < debtors.length && j < creditors.length) {
+    const pay = Math.min(debtors[i].amount, creditors[j].amount);
+    result.push({ from: debtors[i].member, to: creditors[j].member, amount: pay });
+    debtors[i].amount -= pay;
+    creditors[j].amount -= pay;
+    if (debtors[i].amount <= EPS) i++;
+    if (creditors[j].amount <= EPS) j++;
+  }
+  return result;
+}
+
+// ---------- small UI atoms ----------
+function TicketDivider() {
+  return (
+    <div className="flex items-center gap-1 my-4" aria-hidden="true">
+      <div className="w-3 h-3 rounded-full" style={{ background: C.cream, marginLeft: -22 }} />
+      <div className="flex-1 border-t-2 border-dashed" style={{ borderColor: C.line }} />
+      <div className="w-3 h-3 rounded-full" style={{ background: C.cream, marginRight: -22 }} />
+    </div>
+  );
+}
+
+function Card({ children, style, className = "" }) {
+  return (
+    <div
+      className={`rounded-3xl p-5 ${className}`}
+      style={{
+        background: C.paper,
+        border: `1px solid ${C.line}`,
+        boxShadow: "0 1px 2px rgba(92,69,53,0.06), 0 10px 24px -16px rgba(92,69,53,0.25)",
+        ...style,
+      }}
+    >
+      {children}
+    </div>
+  );
+}
+
+function Field({ label, children }) {
+  return (
+    <label className="block mb-3">
+      <span className="block text-xs mb-1 font-medium tracking-wide" style={{ color: C.inkSoft }}>
+        {label}
+      </span>
+      {children}
+    </label>
+  );
+}
+
+const inputStyle = {
+  fontFamily: "'Zen Maru Gothic', sans-serif",
+  border: `1px solid ${C.line}`,
+  background: "white",
+};
+
+function TextInput(props) {
+  return (
+    <input
+      {...props}
+      className={`w-full rounded-lg px-3 py-2 text-sm outline-none focus:ring-2 ${props.className || ""}`}
+      style={{ ...inputStyle, ...(props.style || {}) }}
+      onFocus={(e) => (e.target.style.borderColor = C.persimmon)}
+      onBlur={(e) => (e.target.style.borderColor = C.line)}
+    />
+  );
+}
+
+// 金額入力：3桁カンマ区切りで表示しつつ、値は数字文字列で保持
+function MoneyInput({ value, onChange, placeholder = "0", className = "", style = {} }) {
+  const display = value === "" || value === null || value === undefined
+    ? ""
+    : Number(value).toLocaleString("en-US");
+  const handleChange = (e) => {
+    const raw = e.target.value.replace(/[^0-9]/g, "");
+    onChange(raw);
+  };
+  return (
+    <input
+      type="text"
+      inputMode="numeric"
+      value={display}
+      onChange={handleChange}
+      placeholder={placeholder}
+      className={`w-full rounded-lg px-3 py-2 text-sm outline-none focus:ring-2 ${className}`}
+      style={{ ...inputStyle, fontFamily: "'Quicksand', monospace", ...style }}
+      onFocus={(e) => (e.target.style.borderColor = C.persimmon)}
+      onBlur={(e) => (e.target.style.borderColor = C.line)}
+    />
+  );
+}
+
+function Btn({ children, onClick, variant = "solid", className = "", type = "button" }) {
+  const styles =
+    variant === "solid"
+      ? { background: C.persimmon, color: "white", letterSpacing: "0.02em" }
+      : variant === "ghost"
+      ? { background: "transparent", color: C.night, border: `1px solid ${C.line}` }
+      : { background: C.night, color: "white" };
+  return (
+    <button
+      type={type}
+      onClick={onClick}
+      className={`px-3 py-2 rounded-lg text-sm font-medium inline-flex items-center gap-1.5 active:scale-95 transition ${className}`}
+      style={styles}
+    >
+      {children}
+    </button>
+  );
+}
+
+function IconBtn({ onClick, title, danger }) {
+  const [confirming, setConfirming] = useState(false);
+  useEffect(() => {
+    if (!confirming) return;
+    const t = setTimeout(() => setConfirming(false), 3000);
+    return () => clearTimeout(t);
+  }, [confirming]);
+
+  if (danger) {
+    return (
+      <button
+        onClick={() => {
+          if (confirming) {
+            setConfirming(false);
+            onClick();
+          } else {
+            setConfirming(true);
+          }
+        }}
+        title={confirming ? "もう一度押すと削除されます" : title}
+        className="p-1.5 rounded-md transition inline-flex items-center gap-1"
+        style={
+          confirming
+            ? { background: C.persimmon, color: "white" }
+            : { color: C.persimmon }
+        }
+      >
+        <Trash2 size={16} />
+        {confirming && <span className="text-[10px] font-medium pr-0.5">削除？</span>}
+      </button>
+    );
+  }
+  return (
+    <button
+      onClick={onClick}
+      title={title}
+      className="p-1.5 rounded-md hover:opacity-70 transition"
+      style={{ color: C.inkSoft }}
+    >
+      <Trash2 size={16} />
+    </button>
+  );
+}
+
+function Empty({ text }) {
+  return (
+    <div className="text-center py-10 text-sm" style={{ color: C.inkSoft }}>
+      {text}
+    </div>
+  );
+}
+
+// ---------- App ----------
+function App() {
+  const [loading, setLoading] = useState(true);
+  const [trips, setTrips] = useState([]); // [{ id, year }] — id は固有、year は表示用ラベル（重複OK）
+  const [tripId, setTripId] = useState(null);
+  const [trip, setTrip] = useState(emptyTrip());
+  const [prevReflection, setPrevReflection] = useState([]);
+  const [prevMembers, setPrevMembers] = useState([]);
+  const [tab, setTab] = useState("home");
+  const [moneyView, setMoneyView] = useState("detail");
+  const [myId, setMyId] = useState(null); // 「あなたは誰？」の選択。アプリ全体で共有（端末ごとに記憶されます）
+  const [saveState, setSaveState] = useState("idle"); // idle | saving | saved
+
+  const currentYear = trips.find((t) => t.id === tripId)?.year || "";
+
+  const chooseMyId = async (id) => {
+    setMyId(id);
+    try {
+      await window.storage.set(`whoAmI:${tripId}`, id || "", false);
+    } catch (e) {
+      console.error("whoAmI save failed", e);
+    }
+  };
+
+  // load trips + current trip on mount
+  useEffect(() => {
+    (async () => {
+      try {
+        let list = null;
+        try {
+          const res = await window.storage.get("trips", true);
+          list = res ? JSON.parse(res.value) : null;
+        } catch {
+          list = null;
+        }
+        if (!list) {
+          // 旧バージョン（年=ID）からの移行。既存データが消えないよう、id=年のまま引き継ぐ
+          let yrs = [];
+          try {
+            const res = await window.storage.get("years", true);
+            yrs = res ? JSON.parse(res.value) : [];
+          } catch {
+            yrs = [];
+          }
+          if (yrs.length === 0) yrs = [new Date().getFullYear().toString()];
+          list = [...yrs].sort().map((y) => ({ id: y, year: y }));
+          await window.storage.set("trips", JSON.stringify(list), true);
+        }
+        setTrips(list);
+        const latest = list[list.length - 1];
+        setTripId(latest.id);
+        await loadTrip(latest.id, list);
+      } catch (e) {
+        console.error(e);
+      } finally {
+        setLoading(false);
+      }
+    })();
+    // eslint-disable-next-line
+  }, []);
+
+  const loadTrip = async (id, tripsList = trips) => {
+    try {
+      const res = await window.storage.get(`trip:${id}`, true);
+      setTrip(res ? JSON.parse(res.value) : emptyTrip());
+    } catch {
+      setTrip(emptyTrip());
+    }
+    // this device's "who am I" choice for this trip（personal, not shared with the group）
+    try {
+      const res = await window.storage.get(`whoAmI:${id}`, false);
+      setMyId(res && res.value ? res.value : null);
+    } catch {
+      setMyId(null);
+    }
+    // load the previous trip's reflection notes to show on this trip's home
+    const idx = tripsList.findIndex((t) => t.id === id);
+    const prevTrip = idx > 0 ? tripsList[idx - 1] : null;
+    if (prevTrip) {
+      try {
+        const res = await window.storage.get(`trip:${prevTrip.id}`, true);
+        const prev = res ? JSON.parse(res.value) : null;
+        setPrevReflection(prev?.reflection || []);
+        setPrevMembers(prev?.members || []);
+      } catch {
+        setPrevReflection([]);
+        setPrevMembers([]);
+      }
+    } else {
+      setPrevReflection([]);
+      setPrevMembers([]);
+    }
+  };
+
+  const save = useCallback(
+    async (nextTrip, id = tripId) => {
+      setTrip(nextTrip);
+      setSaveState("saving");
+      try {
+        const result = await window.storage.set(`trip:${id}`, JSON.stringify(nextTrip), true);
+        setSaveState(result ? "saved" : "idle");
+        setTimeout(() => setSaveState("idle"), 1200);
+      } catch (e) {
+        console.error("save failed", e);
+        setSaveState("idle");
+      }
+    },
+    [tripId]
+  );
+
+  const switchTrip = async (id) => {
+    setTripId(id);
+    setLoading(true);
+    await loadTrip(id);
+    setLoading(false);
+  };
+
+  const [yearDraft, setYearDraft] = useState(null); // null = form hidden, else string being typed（次の旅の「年」ラベル）
+  const [showSettings, setShowSettings] = useState(false);
+  const [yearError, setYearError] = useState("");
+
+  const startAddYear = () => {
+    const lastYear = trips[trips.length - 1]?.year || new Date().getFullYear().toString();
+    setYearError("");
+    setYearDraft((parseInt(lastYear) + 1).toString());
+  };
+
+  const cancelAddYear = () => {
+    setYearDraft(null);
+    setYearError("");
+  };
+
+  const confirmAddYear = async () => {
+    const y = (yearDraft || "").trim();
+    if (!/^\d{4}$/.test(y)) {
+      setYearError("4桁の年（例: 2026）で入力してください");
+      return;
+    }
+    const newTrip = { id: uid(), year: y };
+    const newTrips = [...trips, newTrip];
+    setTrips(newTrips);
+    await window.storage.set("trips", JSON.stringify(newTrips), true);
+    setYearDraft(null);
+    setYearError("");
+    await switchTrip(newTrip.id);
+  };
+
+  const deleteTrip = async (id) => {
+    if (trips.length <= 1) return; // 最後の1件は消せない
+    const newTrips = trips.filter((t) => t.id !== id);
+    setTrips(newTrips);
+    await window.storage.set("trips", JSON.stringify(newTrips), true);
+    try {
+      await window.storage.delete(`trip:${id}`, true);
+    } catch (e) {
+      console.error("trip data delete failed", e);
+    }
+    if (id === tripId) {
+      const next = newTrips[newTrips.length - 1];
+      await switchTrip(next.id);
+    }
+  };
+
+  if (loading) {
+    return (
+      <div className="min-h-[500px] flex items-center justify-center" style={{ background: C.cream }}>
+        <Loader2 className="animate-spin" color={C.persimmon} size={28} />
+      </div>
+    );
+  }
+
+  return (
+    <div
+      style={{
+        background: `radial-gradient(circle at 1px 1px, ${C.line} 1px, transparent 0) 0 0/16px 16px, ${C.cream}`,
+        minHeight: "100%",
+        fontFamily: "'Zen Maru Gothic', sans-serif",
+      }}
+    >
+      <style>{FONTS}</style>
+      <Header
+        year={currentYear}
+        subtitle={trip.subtitle}
+        saveState={saveState}
+        onOpenSettings={() => setShowSettings(true)}
+      />
+      {showSettings && (
+        <YearSettingsModal
+          trips={trips}
+          tripId={tripId}
+          onSwitch={switchTrip}
+          onDelete={deleteTrip}
+          onClose={() => {
+            setShowSettings(false);
+            cancelAddYear();
+          }}
+          yearDraft={yearDraft}
+          onStartAddYear={startAddYear}
+          onChangeYearDraft={setYearDraft}
+          onConfirmAddYear={confirmAddYear}
+          onCancelAddYear={cancelAddYear}
+          yearError={yearError}
+          subtitle={trip.subtitle}
+          onChangeSubtitle={(v) => save({ ...trip, subtitle: v })}
+        />
+      )}
+      <TabBar tab={tab} setTab={setTab} />
+      <main className="max-w-3xl mx-auto px-4 pb-16 pt-5">
+        {tab === "home" && (
+          <Home
+            trip={trip}
+            year={currentYear}
+            setTab={setTab}
+            save={save}
+            prevReflection={prevReflection}
+            myId={myId}
+            onSelectMe={chooseMyId}
+            onOpenMoneyResult={() => {
+              setMoneyView("result");
+              setTab("money");
+            }}
+          />
+        )}
+        {tab === "registration" && <Registration trip={trip} save={save} />}
+        {tab === "hotel" && <HotelTab trip={trip} save={save} />}
+        {tab === "schedule" && <ScheduleTab trip={trip} save={save} myId={myId} />}
+        {tab === "money" && <Money trip={trip} save={save} myId={myId} initialView={moneyView} />}
+        {tab === "wishlist" && <Wishlist trip={trip} save={save} />}
+        {tab === "shopping" && <ShoppingTab trip={trip} save={save} myId={myId} />}
+        {tab === "packing" && <Packing trip={trip} save={save} myId={myId} setMyId={chooseMyId} setTab={setTab} />}
+        {tab === "summary" && <Summary trip={trip} save={save} myId={myId} setMyId={chooseMyId} setTab={setTab} />}
+      </main>
+    </div>
+  );
+}
+
+// ---------- Header ----------
+function Header({ year, subtitle, saveState, onOpenSettings }) {
+  return (
+    <div
+      style={{ background: C.night, borderRadius: "0 0 28px 28px" }}
+      className="text-white relative"
+    >
+      <div className="max-w-3xl mx-auto px-4 pt-6 pb-6 relative">
+        <button
+          onClick={onOpenSettings}
+          className="absolute right-4 top-1/2 -translate-y-1/2 p-2 rounded-full"
+          style={{ background: "rgba(255,255,255,0.1)", color: C.cream }}
+          aria-label="旅の設定"
+        >
+          <Settings size={18} />
+        </button>
+        <div
+          className="absolute right-4 text-xs"
+          style={{ top: "calc(50% + 24px)", color: saveState === "idle" ? "transparent" : C.gold }}
+        >
+          {saveState === "saving" ? "保存中…" : saveState === "saved" ? "保存済み" : "\u00A0"}
+        </div>
+        <div className="flex flex-col items-center text-center px-10">
+          <img
+            src={LOGO_DATA_URI}
+            alt={APP_TITLE}
+            className="w-full max-w-[260px] h-auto"
+            style={{ filter: "drop-shadow(0 3px 10px rgba(0,0,0,0.25))" }}
+          />
+          <div
+            className="text-base mt-1.5 font-medium"
+            style={{ color: C.cream, opacity: 0.9, fontFamily: "'Zen Maru Gothic', sans-serif" }}
+          >
+            {subtitle || `${year}年の旅`}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ---------- Year settings modal ----------
+function SubtitleField({ subtitle, onSave }) {
+  const [val, setVal] = useState(subtitle || "");
+  const [justSaved, setJustSaved] = useState(false);
+
+  const handleSave = () => {
+    onSave(val);
+    setJustSaved(true);
+    setTimeout(() => setJustSaved(false), 1500);
+  };
+
+  return (
+    <div className="flex items-center gap-2">
+      <input
+        type="text"
+        value={val}
+        onChange={(e) => {
+          setVal(e.target.value);
+          setJustSaved(false);
+        }}
+        onKeyDown={(e) => e.key === "Enter" && handleSave()}
+        placeholder="例: vol.4 / 4回目のソウル"
+        className="flex-1 rounded-xl px-3 py-2 text-sm outline-none"
+        style={{ background: "white", color: C.ink, border: `1px solid ${C.line}` }}
+      />
+      <button
+        onClick={handleSave}
+        className="px-3 py-2 rounded-xl text-sm font-medium whitespace-nowrap"
+        style={
+          justSaved
+            ? { background: C.teal, color: "white" }
+            : { background: C.persimmon, color: "white" }
+        }
+      >
+        {justSaved ? "✓ 登録済み" : "登録する"}
+      </button>
+    </div>
+  );
+}
+
+function YearSettingsModal({
+  trips,
+  tripId,
+  onSwitch,
+  onDelete,
+  onClose,
+  yearDraft,
+  onStartAddYear,
+  onChangeYearDraft,
+  onConfirmAddYear,
+  onCancelAddYear,
+  yearError,
+  subtitle,
+  onChangeSubtitle,
+}) {
+  const currentYear = trips.find((t) => t.id === tripId)?.year || "";
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-end sm:items-center justify-center"
+      style={{ background: "rgba(60,45,35,0.45)" }}
+      onClick={onClose}
+    >
+      <div
+        className="w-full sm:max-w-sm rounded-t-3xl sm:rounded-3xl p-5 max-h-[85vh] overflow-y-auto"
+        style={{ background: C.paper }}
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="flex items-center justify-between mb-4">
+          <h2
+            className="text-lg"
+            style={{ fontFamily: "'M PLUS Rounded 1c', sans-serif", fontWeight: 800, color: C.ink }}
+          >
+            旅の設定
+          </h2>
+          <button onClick={onClose} className="p-1.5 rounded-full" style={{ color: C.inkSoft }}>
+            <X size={18} />
+          </button>
+        </div>
+
+        <div className="mb-5">
+          <label className="text-xs font-medium block mb-1.5" style={{ color: C.inkSoft }}>
+            {currentYear}年の旅のサブタイトル
+          </label>
+          <SubtitleField subtitle={subtitle} onSave={onChangeSubtitle} />
+        </div>
+
+        <div className="text-xs font-medium mb-1.5" style={{ color: C.inkSoft }}>
+          旅を切り替え
+        </div>
+        <div className="flex flex-col gap-2 mb-4">
+          {trips.map((t, i) => {
+            const dupIndex = trips.slice(0, i + 1).filter((x) => x.year === t.year).length;
+            const dupCount = trips.filter((x) => x.year === t.year).length;
+            return (
+              <div key={t.id} className="flex items-center gap-1.5">
+                <button
+                  onClick={() => {
+                    onSwitch(t.id);
+                    onClose();
+                  }}
+                  className="flex-1 px-4 py-2.5 rounded-2xl text-sm font-medium text-left"
+                  style={
+                    t.id === tripId
+                      ? { background: C.persimmon, color: "white" }
+                      : { background: C.cream, color: C.ink, border: `1px solid ${C.line}` }
+                  }
+                >
+                  {t.year}年{dupCount > 1 ? `（${dupIndex}）` : ""}
+                </button>
+                {trips.length > 1 && <IconBtn danger onClick={() => onDelete(t.id)} title="この旅を削除" />}
+              </div>
+            );
+          })}
+        </div>
+
+        {yearDraft === null ? (
+          <button
+            onClick={onStartAddYear}
+            className="w-full px-3 py-2.5 rounded-2xl text-sm inline-flex items-center justify-center gap-1.5"
+            style={{ border: `1px dashed ${C.inkSoft}`, color: C.inkSoft }}
+          >
+            <Plus size={14} /> 新しい旅を追加
+          </button>
+        ) : (
+          <div className="rounded-2xl p-3" style={{ background: C.cream, border: `1px solid ${C.line}` }}>
+            <div className="flex items-center gap-2">
+              <input
+                type="text"
+                inputMode="numeric"
+                value={yearDraft}
+                onChange={(e) => onChangeYearDraft(e.target.value)}
+                onKeyDown={(e) => e.key === "Enter" && onConfirmAddYear()}
+                placeholder="例: 2026"
+                autoFocus
+                className="w-24 rounded-lg px-3 py-1.5 text-sm outline-none"
+                style={{ background: "white", color: C.ink, border: `1px solid ${C.line}` }}
+              />
+              <span className="text-xs" style={{ color: C.inkSoft }}>年</span>
+            </div>
+            <div className="text-[11px] mt-1.5" style={{ color: C.inkSoft }}>
+              同じ年に2回目の旅でもOKです（サブタイトルで見分けられます）
+            </div>
+            {yearError && (
+              <div className="text-xs mt-1.5" style={{ color: C.persimmon }}>
+                {yearError}
+              </div>
+            )}
+            <div className="flex items-center gap-2 mt-2.5">
+              <button
+                onClick={onConfirmAddYear}
+                className="flex-1 px-3 py-1.5 rounded-full text-sm font-medium"
+                style={{ background: C.persimmon, color: "white" }}
+              >
+                追加する
+              </button>
+              <button
+                onClick={onCancelAddYear}
+                className="px-3 py-1.5 rounded-full text-sm"
+                style={{ color: C.inkSoft }}
+              >
+                キャンセル
+              </button>
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function TabBar({ tab, setTab }) {
+  return (
+    <div
+      className="sticky top-0 z-10 overflow-x-auto"
+      style={{ background: C.paper, borderBottom: `1px solid ${C.line}` }}
+    >
+      <div className="flex gap-1 max-w-3xl mx-auto px-3 py-2 min-w-max">
+        {TABS.map((t) => {
+          const Icon = t.icon;
+          const active = tab === t.id;
+          return (
+            <button
+              key={t.id}
+              onClick={() => setTab(t.id)}
+              className="px-3 py-1.5 rounded-lg text-xs font-medium inline-flex items-center gap-1.5 whitespace-nowrap transition"
+              style={
+                active
+                  ? { background: C.night, color: "white" }
+                  : { background: "transparent", color: C.inkSoft }
+              }
+            >
+              <Icon size={14} />
+              {t.label}
+            </button>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+// ---------- Home ----------
+function useCountUp(target, durationMs = 700) {
+  const [n, setN] = useState(0);
+  useEffect(() => {
+    let raf;
+    const start = performance.now();
+    const from = 0;
+    const tick = (now) => {
+      const t = Math.min(1, (now - start) / durationMs);
+      const eased = 1 - Math.pow(1 - t, 3);
+      setN(Math.round(from + (target - from) * eased));
+      if (t < 1) raf = requestAnimationFrame(tick);
+    };
+    raf = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(raf);
+  }, [target]);
+  return n;
+}
+
+function Ring({ pct, color, size = 68, label, sub }) {
+  const stroke = 7;
+  const r = (size - stroke) / 2;
+  const c = 2 * Math.PI * r;
+  const [filled, setFilled] = useState(0);
+  useEffect(() => {
+    const t = setTimeout(() => setFilled(pct), 80);
+    return () => clearTimeout(t);
+  }, [pct]);
+  return (
+    <div className="flex flex-col items-center gap-1.5">
+      <div className="relative" style={{ width: size, height: size }}>
+        <svg width={size} height={size} style={{ transform: "rotate(-90deg)" }}>
+          <circle cx={size / 2} cy={size / 2} r={r} fill="none" stroke={C.line} strokeWidth={stroke} />
+          <circle
+            cx={size / 2}
+            cy={size / 2}
+            r={r}
+            fill="none"
+            stroke={color}
+            strokeWidth={stroke}
+            strokeLinecap="round"
+            strokeDasharray={c}
+            strokeDashoffset={c - (filled / 100) * c}
+            style={{ transition: "stroke-dashoffset 900ms cubic-bezier(.22,1,.36,1)" }}
+          />
+        </svg>
+        <div
+          className="absolute inset-0 flex items-center justify-center text-sm font-bold"
+          style={{ color: C.ink, fontFamily: "'M PLUS Rounded 1c', sans-serif" }}
+        >
+          {pct}%
+        </div>
+      </div>
+      <div className="text-center">
+        <div className="text-xs font-medium" style={{ color: C.ink }}>{label}</div>
+        {sub && <div className="text-[10px]" style={{ color: C.inkSoft }}>{sub}</div>}
+      </div>
+    </div>
+  );
+}
+
+// 出発日が近い（16日以内）ときだけソウルの天気予報を表示
+const WEATHER_ICONS = {
+  0: "☀️", 1: "🌤️", 2: "⛅", 3: "☁️",
+  45: "🌫️", 48: "🌫️",
+  51: "🌦️", 53: "🌦️", 55: "🌦️",
+  61: "🌧️", 63: "🌧️", 65: "🌧️",
+  71: "🌨️", 73: "🌨️", 75: "🌨️",
+  80: "🌦️", 81: "🌧️", 82: "⛈️",
+  95: "⛈️", 96: "⛈️", 99: "⛈️",
+};
+function weatherEmoji(code) {
+  return WEATHER_ICONS[code] || "🌡️";
+}
+
+function WeatherForecast({ first, last }) {
+  const [data, setData] = useState(null);
+  const [state, setState] = useState("idle"); // idle | loading | ok | error | toofar
+
+  useEffect(() => {
+    if (!first) return;
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    const startD = new Date(first);
+    const daysUntil = Math.ceil((startD - today) / 86400000);
+    if (daysUntil > 15 || daysUntil < -1) {
+      setState("toofar");
+      return;
+    }
+    setState("loading");
+    const end = last || first;
+    const url = `https://api.open-meteo.com/v1/forecast?latitude=37.5665&longitude=126.9780&daily=weathercode,temperature_2m_max,temperature_2m_min&timezone=Asia%2FSeoul&start_date=${first}&end_date=${end}`;
+    fetch(url)
+      .then((r) => r.json())
+      .then((json) => {
+        if (json?.daily?.time) {
+          setData(json.daily);
+          setState("ok");
+        } else {
+          setState("error");
+        }
+      })
+      .catch(() => setState("error"));
+  }, [first, last]);
+
+  if (!first || state === "idle" || state === "toofar" || state === "error") return null;
+
+  return (
+    <Card>
+      <div className="text-sm font-medium mb-3" style={{ color: C.ink }}>
+        ソウルの天気予報
+      </div>
+      {state === "loading" && (
+        <p className="text-xs" style={{ color: C.inkSoft }}>
+          読み込み中…
+        </p>
+      )}
+      {state === "ok" && data && (
+        <div className="flex gap-3 overflow-x-auto pb-1">
+          {data.time.map((d, i) => (
+            <div key={d} className="flex flex-col items-center shrink-0" style={{ minWidth: 52 }}>
+              <span className="text-[11px]" style={{ color: C.inkSoft }}>
+                {fmtDateWithWeekday(d)}
+              </span>
+              <span className="text-2xl my-1">{weatherEmoji(data.weathercode[i])}</span>
+              <span className="text-xs font-medium" style={{ color: C.persimmon }}>
+                {Math.round(data.temperature_2m_max[i])}°
+              </span>
+              <span className="text-xs" style={{ color: C.inkSoft }}>
+                {Math.round(data.temperature_2m_min[i])}°
+              </span>
+            </div>
+          ))}
+        </div>
+      )}
+    </Card>
+  );
+}
+
+// 100%達成時に一瞬だけ出る紙吹雪演出
+const CONFETTI_COLORS = ["#DD8E98", "#8FAE93", "#DDAA4E", "#6B4738", "#FBF0DC"];
+function Confetti() {
+  const pieces = React.useMemo(
+    () =>
+      Array.from({ length: 26 }).map((_, i) => ({
+        id: i,
+        left: Math.random() * 100,
+        delay: Math.random() * 0.3,
+        duration: 1.6 + Math.random() * 0.8,
+        color: CONFETTI_COLORS[i % CONFETTI_COLORS.length],
+        rotate: Math.random() * 360,
+        size: 6 + Math.random() * 6,
+      })),
+    []
+  );
+  return (
+    <div
+      className="fixed inset-0 pointer-events-none overflow-hidden"
+      style={{ zIndex: 60 }}
+      aria-hidden="true"
+    >
+      <style>{`
+        @keyframes confetti-fall {
+          0% { transform: translateY(-10px) rotate(0deg); opacity: 1; }
+          100% { transform: translateY(110vh) rotate(360deg); opacity: 0.9; }
+        }
+      `}</style>
+      {pieces.map((p) => (
+        <div
+          key={p.id}
+          style={{
+            position: "absolute",
+            left: `${p.left}%`,
+            top: 0,
+            width: p.size,
+            height: p.size * 1.4,
+            background: p.color,
+            borderRadius: 2,
+            animation: `confetti-fall ${p.duration}s ease-in ${p.delay}s forwards`,
+          }}
+        />
+      ))}
+    </div>
+  );
+}
+
+function Home({ trip, year, setTab, save, prevReflection, myId, onSelectMe, onOpenMoneyResult }) {
+  const totalJpy = trip.expenses.reduce(
+    (s, e) => s + krwToJpy(e.amountKrw, e.exchangeRate || trip.exchangeRate),
+    0
+  );
+  const myPaidJpy = trip.expenses
+    .filter((e) => e.payerId === myId)
+    .reduce((s, e) => s + krwToJpy(e.amountKrw, e.exchangeRate || trip.exchangeRate), 0);
+  const myPaidKrw = trip.expenses
+    .filter((e) => e.payerId === myId)
+    .reduce((s, e) => s + (parseFloat(e.amountKrw) || 0), 0);
+  const dates = Object.values(trip.travel)
+    .flatMap((t) => [t.startDate, t.endDate])
+    .filter(Boolean)
+    .sort();
+  const first = dates[0];
+  const last = dates[dates.length - 1];
+
+  const heroPhotoInputId = "hero-photo-input";
+  const handlePhotoChange = (e) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      save({ ...trip, heroPhoto: reader.result });
+    };
+    reader.readAsDataURL(file);
+    e.target.value = "";
+  };
+
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+  const firstDate = first ? new Date(first) : null;
+  const lastDate = last ? new Date(last) : null;
+  let dday = null;
+  let phase = "before"; // before | during | after | unset
+  if (firstDate) {
+    const diffDays = Math.ceil((firstDate - today) / 86400000);
+    if (lastDate && today > lastDate) {
+      phase = "after";
+    } else if (diffDays <= 0 && lastDate && today <= lastDate) {
+      phase = "during";
+    } else {
+      phase = "before";
+      dday = diffDays;
+    }
+  } else {
+    phase = "unset";
+  }
+  const ddayCount = useCountUp(dday && dday > 0 ? dday : 0);
+
+  const travelSetCount = trip.members.filter((m) => trip.travel[m.id]?.startDate).length;
+  const schedulePct = trip.members.length ? Math.round((travelSetCount / trip.members.length) * 100) : 0;
+
+  const totalChecks = trip.packing.length * Math.max(trip.members.length, 1);
+  const doneChecks = trip.packing.reduce(
+    (s, p) => s + Object.values(p.checkedBy || {}).filter(Boolean).length,
+    0
+  );
+  const packingPct = totalChecks ? Math.round((doneChecks / totalChecks) * 100) : 0;
+
+  const [showConfetti, setShowConfetti] = useState(false);
+  const prevPackingPct = React.useRef(packingPct);
+  useEffect(() => {
+    if (packingPct === 100 && prevPackingPct.current < 100 && totalChecks > 0) {
+      setShowConfetti(true);
+      const t = setTimeout(() => setShowConfetti(false), 2200);
+      return () => clearTimeout(t);
+    }
+    prevPackingPct.current = packingPct;
+    // eslint-disable-next-line
+  }, [packingPct]);
+
+  const hasMembers = trip.members.length > 0;
+  const hasWishlist = Object.values(trip.wishlist || {}).some((l) => (l || []).length > 0);
+  const hasShopping = (trip.shopping || []).length > 0;
+  const hasPacking = trip.packing.length > 0;
+  const onboardingSteps = [
+    { done: hasMembers, tab: "registration", emoji: "👥", label: "登録", desc: "一緒に行くメンバーを追加しよう" },
+    { done: hasWishlist, tab: "wishlist", emoji: "📍", label: "行きたい場所", desc: "気になるスポットをメモしよう" },
+    { done: hasShopping, tab: "shopping", emoji: "🛍️", label: "買い物リスト", desc: "買いたいものを溜めておこう" },
+    { done: hasPacking, tab: "packing", emoji: "🎒", label: "持ち物", desc: "忘れ物チェックリストを作ろう" },
+  ];
+  const showOnboarding = onboardingSteps.some((s) => !s.done);
+
+  return (
+    <div className="space-y-4">
+      {showConfetti && (
+        <>
+          <Confetti />
+          <div
+            className="rounded-2xl p-3 text-center text-sm font-semibold"
+            style={{ background: C.teal, color: "white" }}
+          >
+            🎉 持ち物の準備、100%達成！
+          </div>
+        </>
+      )}
+      {showOnboarding && (
+        <Card style={{ border: `1.5px dashed ${C.gold}` }}>
+          <div className="text-sm font-semibold mb-1" style={{ color: C.ink }}>
+            👋 ようこそ！まずはここから
+          </div>
+          <p className="text-xs mb-3" style={{ color: C.inkSoft }}>
+            このアプリでできることを、順番に触ってみましょう
+          </p>
+          <div className="space-y-2">
+            {onboardingSteps.map((s) => (
+              <button
+                key={s.tab}
+                onClick={() => setTab(s.tab)}
+                className="w-full flex items-center gap-2 px-3 py-2.5 rounded-2xl text-left"
+                style={{ background: C.cream, opacity: s.done ? 0.55 : 1 }}
+              >
+                <span className="text-lg">{s.done ? "✅" : s.emoji}</span>
+                <span
+                  className="text-sm flex-1"
+                  style={{ color: C.ink, textDecoration: s.done ? "line-through" : "none" }}
+                >
+                  <b>{s.label}</b> — {s.desc}
+                </span>
+                {!s.done && (
+                  <ChevronDown size={14} style={{ transform: "rotate(-90deg)", color: C.inkSoft }} />
+                )}
+              </button>
+            ))}
+          </div>
+        </Card>
+      )}
+
+      {/* Hero */}
+      <div
+        className="rounded-3xl p-5 relative overflow-hidden"
+        style={{
+          background: trip.heroPhoto
+            ? `linear-gradient(180deg, rgba(30,20,15,0.15), rgba(30,20,15,0.75)), url(${trip.heroPhoto}) center/cover no-repeat`
+            : `linear-gradient(135deg, ${C.night}, #5A4536)`,
+          minHeight: 168,
+        }}
+      >
+        {!trip.heroPhoto && (
+          <div
+            className="absolute -right-8 -top-8 w-32 h-32 rounded-full opacity-20"
+            style={{ background: C.gold }}
+          />
+        )}
+        <input
+          id={heroPhotoInputId}
+          type="file"
+          accept="image/*"
+          onChange={handlePhotoChange}
+          className="hidden"
+        />
+        <label
+          htmlFor={heroPhotoInputId}
+          className="absolute right-3 top-3 z-10 text-[11px] px-2.5 py-1 rounded-full inline-flex items-center gap-1 cursor-pointer"
+          style={{ background: "rgba(255,255,255,0.85)", color: C.ink, fontWeight: 600 }}
+        >
+          📷 {trip.heroPhoto ? "写真を変更" : "写真を追加"}
+        </label>
+        <div
+          className="text-xs tracking-[0.2em] mb-1 relative"
+          style={{ color: C.gold, fontFamily: "'Quicksand', monospace" }}
+        >
+          {year}年 の旅
+        </div>
+        {phase === "before" && (
+          <div className="relative">
+            <div className="flex items-baseline gap-1.5">
+              <span
+                className="text-5xl font-black text-white"
+                style={{ fontFamily: "'M PLUS Rounded 1c', sans-serif" }}
+              >
+                {ddayCount}
+              </span>
+              <span className="text-lg font-bold text-white">日後</span>
+            </div>
+            <div className="text-xs mt-1" style={{ color: C.cream }}>
+              {first?.slice(5).replace("-", "/")}〜{last?.slice(5).replace("-", "/") || ""} 出発まで
+            </div>
+          </div>
+        )}
+        {phase === "during" && (
+          <div className="relative">
+            <div className="text-3xl font-black text-white" style={{ fontFamily: "'M PLUS Rounded 1c', sans-serif" }}>
+              🎉 旅の真っ最中！
+            </div>
+            <div className="text-xs mt-1" style={{ color: C.cream }}>楽しんできてください</div>
+          </div>
+        )}
+        {phase === "after" && (
+          <div className="relative">
+            <div className="text-2xl font-black text-white" style={{ fontFamily: "'M PLUS Rounded 1c', sans-serif" }}>
+              おかえりなさい ☕
+            </div>
+            <div className="text-xs mt-1" style={{ color: C.cream }}>また来年、韓国へ</div>
+          </div>
+        )}
+        {phase === "unset" && (
+          <div className="relative">
+            <div className="text-xl font-bold text-white" style={{ fontFamily: "'M PLUS Rounded 1c', sans-serif" }}>
+              まだ日程が未定です
+            </div>
+            <button
+              onClick={() => setTab("registration")}
+              className="mt-2 text-xs px-3 py-1.5 rounded-full inline-flex items-center gap-1"
+              style={{ background: C.gold, color: C.night, fontWeight: 700 }}
+            >
+              日程を決める
+            </button>
+          </div>
+        )}
+      </div>
+
+      <WeatherForecast first={first} last={last} />
+
+      {/* Progress rings */}
+      <Card>
+        <div className="text-sm font-medium mb-3" style={{ color: C.ink }}>
+          旅の準備状況
+        </div>
+        <div className="flex items-start justify-around">
+          <Ring pct={schedulePct} color={C.persimmon} label="日程" sub={`${travelSetCount}/${trip.members.length || 0}人`} />
+          <Ring pct={packingPct} color={C.teal} label="持ち物" sub={`${doneChecks}/${totalChecks}`} />
+          <div className="flex flex-col items-center gap-1.5">
+            <button
+              onClick={onOpenMoneyResult}
+              className="flex items-center justify-center rounded-full"
+              style={{ width: 68, height: 68, background: C.cream, border: `1px solid ${C.line}` }}
+            >
+              <span className="text-xs font-bold text-center leading-tight" style={{ color: C.ink }}>
+                {myId ? yen(myPaidJpy) : yen(totalJpy)}
+              </span>
+            </button>
+            <div className="text-center">
+              <div className="text-xs font-medium" style={{ color: C.ink }}>
+                {myId ? "自分の支払い" : "旅の合計費用"}
+              </div>
+              {myId
+                ? myPaidKrw > 0 && (
+                    <div className="text-[10px]" style={{ color: C.inkSoft }}>₩{myPaidKrw.toLocaleString()}</div>
+                  )
+                : (
+                    <button onClick={() => setTab("packing")} className="text-[10px] underline" style={{ color: C.inkSoft }}>
+                      自分を選ぶと個人の額が見れます
+                    </button>
+                  )}
+            </div>
+          </div>
+        </div>
+      </Card>
+
+      {trip.members.length === 0 ? (
+        <Card>
+          <Empty text="まずはメンバーを登録しよう" />
+          <div className="flex justify-center">
+            <Btn onClick={() => setTab("registration")}>
+              <Users size={15} /> メンバー登録へ
+            </Btn>
+          </div>
+        </Card>
+      ) : (
+        <Card>
+          <div className="flex items-center justify-between mb-1">
+            <div className="text-sm font-medium" style={{ color: C.ink }}>
+              メンバー別の日程
+            </div>
+          </div>
+          <p className="text-[11px] mb-3" style={{ color: C.inkSoft }}>
+            アイコンをタップして「自分」を選ぶと、持ち物のチェックや評価が自分専用になります
+          </p>
+          <div className="space-y-0">
+            {trip.members.map((m, i) => {
+              const t = trip.travel[m.id] || {};
+              const isMe = myId === m.id;
+              return (
+                <div key={m.id} className="flex items-center gap-3 py-2 relative">
+                  {i < trip.members.length - 1 && (
+                    <div
+                      className="absolute left-[15px] top-9 bottom-0 w-px"
+                      style={{ background: C.line }}
+                    />
+                  )}
+                  <button
+                    onClick={() => onSelectMe(isMe ? null : m.id)}
+                    className="w-8 h-8 rounded-full flex items-center justify-center text-base shrink-0 relative z-10"
+                    style={
+                      isMe
+                        ? { background: C.persimmon, boxShadow: `0 0 0 2px ${C.persimmon}` }
+                        : { background: C.cream, border: `1px solid ${C.line}` }
+                    }
+                    title={isMe ? "自分（タップで解除）" : `${m.name}を自分にする`}
+                  >
+                    {m.emoji || "😀"}
+                  </button>
+                  <div className="flex-1 flex items-center justify-between">
+                    <div>
+                      <div className="text-sm flex items-center gap-1" style={{ color: C.ink }}>
+                        {m.name}
+                        {isMe && (
+                          <span
+                            className="text-[10px] px-1.5 py-[1px] rounded-full"
+                            style={{ background: C.persimmon, color: "white" }}
+                          >
+                            自分
+                          </span>
+                        )}
+                      </div>
+                      {m.motto && (
+                        <div className="text-[11px] mt-0.5" style={{ color: C.persimmon }}>
+                          「{m.motto}」
+                        </div>
+                      )}
+                    </div>
+                    <span className="text-xs shrink-0 pl-2" style={{ color: C.inkSoft, fontFamily: "'Quicksand', monospace" }}>
+                      {t.startDate
+                        ? `${fmtDateWithWeekday(t.startDate)} 〜 ${t.endDate ? fmtDateWithWeekday(t.endDate) : "?"}`
+                        : "未入力"}
+                    </span>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </Card>
+      )}
+
+      {prevReflection && prevReflection.length > 0 && (
+        <Card>
+          <div className="text-sm font-medium mb-2" style={{ color: C.ink }}>
+            前回の反省メモ
+          </div>
+          <div className="space-y-2">
+            {prevReflection.map((r) => {
+              return (
+                <div key={r.id} className="text-sm" style={{ color: C.inkSoft }}>
+                  <span className="mr-1">{r.authorEmoji || "🙂"}</span>
+                  <span className="whitespace-pre-wrap">{r.text}</span>
+                </div>
+              );
+            })}
+          </div>
+        </Card>
+      )}
+    </div>
+  );
+}
+
+function Stat({ label, value, sub }) {
+  return (
+    <div>
+      <div
+        className="text-lg font-bold"
+        style={{ color: C.night, fontFamily: "'M PLUS Rounded 1c', sans-serif" }}
+      >
+        {value}
+      </div>
+      {sub && (
+        <div className="text-[11px]" style={{ color: C.teal, fontFamily: "'Quicksand', monospace" }}>
+          {sub}
+        </div>
+      )}
+      <div className="text-[11px] mt-0.5" style={{ color: C.inkSoft }}>
+        {label}
+      </div>
+    </div>
+  );
+}
+
+// ---------- Members ----------
+const MEMBER_EMOJIS = ["😀", "😎", "🐶", "🐱", "🐻", "🐰", "🦊", "🐼", "🐯", "🐨"];
+
+// ---------- Registration (members + travel) ----------
+// このグループの招待リンクを表示・コピーできるカード
+function InviteLinkCard() {
+  const [copied, setCopied] = useState(false);
+  const inviteLink = `${window.location.origin}${window.location.pathname}?g=${CURRENT_GROUP_ID}`;
+  const copy = async () => {
+    try {
+      await navigator.clipboard.writeText(inviteLink);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    } catch {
+      // クリップボードが使えない環境向けに、選択だけでもできるようにする
+    }
+  };
+  return (
+    <Card>
+      <div className="text-sm font-medium mb-1" style={{ color: C.ink }}>
+        招待リンク
+      </div>
+      <p className="text-xs mb-2" style={{ color: C.inkSoft }}>
+        このリンクを仲間に送ると、Googleログインするだけで同じグループに参加できます
+      </p>
+      <div className="flex gap-2">
+        <input
+          readOnly
+          value={inviteLink}
+          onFocus={(e) => e.target.select()}
+          className="flex-1 rounded-lg px-3 py-2 text-xs outline-none"
+          style={{ ...inputStyle, color: C.inkSoft }}
+        />
+        <Btn onClick={copy}>{copied ? "コピーしました！" : "コピー"}</Btn>
+      </div>
+    </Card>
+  );
+}
+
+function Registration({ trip, save }) {
+  const [name, setName] = useState("");
+  const [emoji, setEmoji] = useState(MEMBER_EMOJIS[0]);
+  const [expanded, setExpanded] = useState({});
+  const toggle = (id) => setExpanded((e) => ({ ...e, [id]: !e[id] }));
+
+  const addMember = () => {
+    if (!name.trim()) return;
+    const m = { id: uid(), name: name.trim(), emoji, motto: "" };
+    save({ ...trip, members: [...trip.members, m] });
+    setName("");
+    setEmoji(MEMBER_EMOJIS[0]);
+  };
+
+  const removeMember = (id) => {
+    const { [id]: _, ...restTravel } = trip.travel;
+    const { [id]: __, ...restWishlist } = trip.wishlist;
+    save({
+      ...trip,
+      members: trip.members.filter((m) => m.id !== id),
+      travel: restTravel,
+      wishlist: restWishlist,
+      schedule: trip.schedule.map((s) => ({ ...s, memberIds: s.memberIds.filter((x) => x !== id) })),
+      expenses: trip.expenses.map((e) => ({
+        ...e,
+        participants: (e.participants || []).filter((x) => x !== id),
+      })),
+    });
+  };
+
+  const setMemberEmoji = (id, em) => {
+    save({ ...trip, members: trip.members.map((m) => (m.id === id ? { ...m, emoji: em } : m)) });
+  };
+  const setMemberMotto = (id, motto) => {
+    save({ ...trip, members: trip.members.map((m) => (m.id === id ? { ...m, motto } : m)) });
+  };
+  const update = (memberId, patch) => {
+    const newTravel = { ...(trip.travel[memberId] || {}), ...patch };
+    const member = trip.members.find((m) => m.id === memberId);
+    let schedule = trip.schedule;
+
+    const upsertOrRemove = (id, condition, itemFields) => {
+      if (condition) {
+        const idx = schedule.findIndex((s) => s.id === id);
+        if (idx >= 0) {
+          schedule = schedule.map((s) => (s.id === id ? { ...s, ...itemFields } : s));
+        } else {
+          schedule = [...schedule, { id, note: "", mapLinkGoogle: "", mapLinkNaver: "", url: "", category: "", memberIds: [memberId], ...itemFields }];
+        }
+      } else {
+        schedule = schedule.filter((s) => s.id !== id);
+      }
+    };
+
+    // 往路の出発 → スケジュールに自動反映
+    upsertOrRemove(
+      `flight-out-depart-${memberId}`,
+      newTravel.startDate && newTravel.flightOutDepart,
+      {
+        date: newTravel.startDate,
+        time: newTravel.flightOutDepart,
+        title: `${member?.name || ""} 韓国へ出発！`,
+        note: newTravel.flightOutNo ? `便名: ${newTravel.flightOutNo}` : "",
+        auto: true,
+      }
+    );
+    // 往路の到着 → スケジュールに自動反映
+    upsertOrRemove(
+      `flight-out-${memberId}`,
+      newTravel.startDate && newTravel.flightOutArrive,
+      {
+        date: newTravel.startDate,
+        time: newTravel.flightOutArrive,
+        title: `✈️ ${member?.name || ""} 到着`,
+        note: newTravel.flightOutNo ? `便名: ${newTravel.flightOutNo}` : "",
+        auto: true,
+      }
+    );
+    // 復路の出発 → スケジュールに自動反映
+    upsertOrRemove(
+      `flight-in-${memberId}`,
+      newTravel.endDate && newTravel.flightInDepart,
+      {
+        date: newTravel.endDate,
+        time: newTravel.flightInDepart,
+        title: `✈️ ${member?.name || ""} 出発（帰国）`,
+        note: newTravel.flightInNo ? `便名: ${newTravel.flightInNo}` : "",
+        auto: true,
+      }
+    );
+    // 帰りの最終到着 → スケジュールに自動反映
+    upsertOrRemove(
+      `flight-in-arrive-${memberId}`,
+      newTravel.endDate && newTravel.flightInArrive,
+      {
+        date: newTravel.endDate,
+        time: newTravel.flightInArrive,
+        title: `${member?.name || ""} 日本着 またね！`,
+        note: newTravel.flightInNo ? `便名: ${newTravel.flightInNo}` : "",
+        auto: true,
+      }
+    );
+
+    save({
+      ...trip,
+      travel: { ...trip.travel, [memberId]: newTravel },
+      schedule,
+    });
+  };
+
+  return (
+    <div className="space-y-4">
+      <InviteLinkCard />
+      <Card>
+        <div className="text-sm font-medium mb-3" style={{ color: C.ink }}>
+          メンバーを追加
+        </div>
+        <div className="flex flex-wrap gap-1.5 mb-3">
+          {MEMBER_EMOJIS.map((em) => (
+            <button
+              key={em}
+              onClick={() => setEmoji(em)}
+              className="w-9 h-9 rounded-full flex items-center justify-center text-lg"
+              style={
+                emoji === em
+                  ? { background: C.persimmon }
+                  : { background: "white", border: `1px solid ${C.line}` }
+              }
+            >
+              {em}
+            </button>
+          ))}
+        </div>
+        <div className="flex gap-2">
+          <TextInput
+            placeholder="名前"
+            value={name}
+            onChange={(e) => setName(e.target.value)}
+            onKeyDown={(e) => e.key === "Enter" && addMember()}
+          />
+          <Btn onClick={addMember}>
+            <Plus size={15} /> 追加
+          </Btn>
+        </div>
+      </Card>
+
+      {trip.members.length === 0 ? (
+        <Empty text="まだメンバーがいません" />
+      ) : (
+        trip.members.map((m) => {
+          const t = trip.travel[m.id] || {};
+          return (
+            <Card key={m.id}>
+              <div className="flex items-center justify-between mb-2">
+                <div className="flex items-center gap-3">
+                  <div
+                    className="w-9 h-9 rounded-full flex items-center justify-center text-lg"
+                    style={{ background: C.cream, border: `1px solid ${C.line}` }}
+                  >
+                    {m.emoji || "😀"}
+                  </div>
+                  <span className="text-sm font-semibold" style={{ color: C.ink }}>
+                    {m.name}
+                  </span>
+                </div>
+                <IconBtn danger onClick={() => removeMember(m.id)} title="削除" />
+              </div>
+              <div className="flex flex-wrap gap-1 mb-2 pl-12">
+                {MEMBER_EMOJIS.map((em) => (
+                  <button
+                    key={em}
+                    onClick={() => setMemberEmoji(m.id, em)}
+                    className="w-6 h-6 rounded-full flex items-center justify-center text-xs"
+                    style={
+                      (m.emoji || MEMBER_EMOJIS[0]) === em
+                        ? { background: C.persimmon }
+                        : { background: "transparent" }
+                    }
+                  >
+                    {em}
+                  </button>
+                ))}
+              </div>
+              <TextInput
+                placeholder="意気込みをひとこと（例: 焼肉を10人前食べる）"
+                value={m.motto || ""}
+                onChange={(e) => setMemberMotto(m.id, e.target.value)}
+                className="mb-3"
+              />
+
+              <div className="grid grid-cols-2 gap-3">
+                <Field label="出発日">
+                  <TextInput type="date" value={t.startDate || ""} onChange={(e) => update(m.id, { startDate: e.target.value })} />
+                </Field>
+                <Field label="帰国日">
+                  <TextInput type="date" value={t.endDate || ""} onChange={(e) => update(m.id, { endDate: e.target.value })} />
+                </Field>
+              </div>
+              <button
+                onClick={() => toggle(m.id)}
+                className="w-full flex items-center justify-between gap-2 mt-1"
+              >
+                <span className="text-xs font-medium" style={{ color: C.inkSoft }}>
+                  フライト情報
+                </span>
+                <ChevronDown
+                  size={16}
+                  style={{
+                    color: C.inkSoft,
+                    transform: expanded[m.id] ? "rotate(180deg)" : "none",
+                    transition: "transform 200ms",
+                  }}
+                />
+              </button>
+              <TicketDivider />
+              {expanded[m.id] && (
+                <>
+              <div className="text-xs font-medium mb-2" style={{ color: C.persimmon }}>
+                往路便
+              </div>
+              <div className="grid grid-cols-2 gap-3">
+                <Field label="出発空港">
+                  <AirportSelect value={t.flightOutFrom} onChange={(v) => update(m.id, { flightOutFrom: v })} placeholder="例: 羽田" />
+                </Field>
+                <Field label="到着空港">
+                  <AirportSelect value={t.flightOutTo} onChange={(v) => update(m.id, { flightOutTo: v })} placeholder="例: 仁川" />
+                </Field>
+              </div>
+              <div className="grid grid-cols-2 gap-3">
+                <Field label="出発時刻">
+                  <TextInput type="time" value={t.flightOutDepart || ""} onChange={(e) => update(m.id, { flightOutDepart: e.target.value })} />
+                </Field>
+                <Field label="到着時刻(現地)">
+                  <TextInput type="time" value={t.flightOutArrive || ""} onChange={(e) => update(m.id, { flightOutArrive: e.target.value })} />
+                </Field>
+              </div>
+              <div className="grid grid-cols-2 gap-3">
+                <Field label="便名">
+                  <TextInput value={t.flightOutNo || ""} onChange={(e) => update(m.id, { flightOutNo: e.target.value })} placeholder="例: KE706" />
+                </Field>
+              </div>
+              <div className="text-xs font-medium mb-2 mt-1" style={{ color: C.teal }}>
+                復路便
+              </div>
+              <div className="grid grid-cols-2 gap-3">
+                <Field label="出発空港">
+                  <AirportSelect value={t.flightInFrom} onChange={(v) => update(m.id, { flightInFrom: v })} placeholder="例: 仁川" />
+                </Field>
+                <Field label="到着空港">
+                  <AirportSelect value={t.flightInTo} onChange={(v) => update(m.id, { flightInTo: v })} placeholder="例: 羽田" />
+                </Field>
+              </div>
+              <div className="grid grid-cols-2 gap-3">
+                <Field label="出発時刻(現地)">
+                  <TextInput type="time" value={t.flightInDepart || ""} onChange={(e) => update(m.id, { flightInDepart: e.target.value })} />
+                </Field>
+                <Field label="到着時刻">
+                  <TextInput type="time" value={t.flightInArrive || ""} onChange={(e) => update(m.id, { flightInArrive: e.target.value })} />
+                </Field>
+              </div>
+              <div className="grid grid-cols-2 gap-3">
+                <Field label="便名">
+                  <TextInput value={t.flightInNo || ""} onChange={(e) => update(m.id, { flightInNo: e.target.value })} placeholder="例: KE705" />
+                </Field>
+              </div>
+                </>
+              )}
+            </Card>
+          );
+        })
+      )}
+    </div>
+  );
+}
+
+// ---------- Travel (dates + flights) ----------
+const AIRPORTS = ["仁川", "金浦", "羽田", "成田", "関空", "神戸"];
+
+function AirportSelect({ value, onChange, placeholder }) {
+  return (
+    <select
+      value={value || ""}
+      onChange={(e) => onChange(e.target.value)}
+      className="w-full rounded-lg px-3 py-2 text-sm outline-none"
+      style={inputStyle}
+    >
+      <option value="">{placeholder || "選択"}</option>
+      {AIRPORTS.map((a) => (
+        <option key={a} value={a}>
+          {a}
+        </option>
+      ))}
+    </select>
+  );
+}
+
+function datesBetween(start, end) {
+  // nights = start .. end-1 (checkout day itself is not a night stayed)
+  if (!start || !end) return [];
+  const out = [];
+  let d = new Date(start);
+  const last = new Date(end);
+  while (d < last) {
+    out.push(d.toISOString().slice(0, 10));
+    d = new Date(d.getTime() + 86400000);
+  }
+  return out;
+}
+
+// ---------- Hotel ----------
+function HotelTab({ trip, save }) {
+  const addHotel = () => {
+    save({
+      ...trip,
+      hotels: [
+        ...trip.hotels,
+        {
+          id: uid(),
+          name: "",
+          address: "",
+          phone: "",
+          mapLink: "",
+          bookingLink: "",
+          memo: "",
+          checkIn: "",
+          checkOut: "",
+          priceKrw: "",
+          nightlyMembers: {},
+          nightlyPrices: {},
+        },
+      ],
+    });
+  };
+  const update = (id, patch) => {
+    save({ ...trip, hotels: trip.hotels.map((h) => (h.id === id ? { ...h, ...patch } : h)) });
+  };
+  const remove = (id) => save({ ...trip, hotels: trip.hotels.filter((h) => h.id !== id) });
+
+  const toggleNightlyMember = (h, date, mid) => {
+    const current = h.nightlyMembers?.[date] ?? trip.members.map((m) => m.id);
+    const has = current.includes(mid);
+    if (has && current.length <= 1) return; // 宿泊メンバーを0人にはできない
+    const next = has ? current.filter((x) => x !== mid) : [...current, mid];
+    update(h.id, { nightlyMembers: { ...(h.nightlyMembers || {}), [date]: next } });
+  };
+
+  const updateNightlyPrice = (h, date, value) => {
+    update(h.id, { nightlyPrices: { ...(h.nightlyPrices || {}), [date]: value } });
+  };
+
+  const nightlyTotal = (h, nights) =>
+    nights.reduce((s, d) => s + (parseFloat(h.nightlyPrices?.[d]) || 0), 0);
+
+  const sendToSettlement = (h, nights) => {
+    // build the desired set of hotel-linked expenses from current inputs
+    let desired;
+    if (nights.length > 0) {
+      desired = nights
+        .filter((date) => (parseFloat(h.nightlyPrices?.[date]) || 0) > 0)
+        .map((date) => ({
+          hotelId: h.id,
+          hotelDate: date,
+          date,
+          description: `🏨 ${h.name || "ホテル代"}（${fmtDateWithWeekday(date)}）`,
+          amountKrw: h.nightlyPrices[date],
+          participants:
+            h.nightlyMembers?.[date] && h.nightlyMembers[date].length > 0
+              ? h.nightlyMembers[date]
+              : trip.members.map((m) => m.id),
+        }));
+    } else if (h.priceKrw) {
+      desired = [
+        {
+          hotelId: h.id,
+          hotelDate: "total",
+          date: h.checkIn || "",
+          description: `🏨 ${h.name || "ホテル代"}`,
+          amountKrw: h.priceKrw,
+          participants: trip.members.map((m) => m.id),
+        },
+      ];
+    } else {
+      desired = [];
+    }
+    if (desired.length === 0) return;
+
+    // remove any previously-linked expenses for this hotel, then re-add current ones
+    // (keeps the payer someone chose manually if one already existed for that date)
+    const keepPayer = {};
+    trip.expenses.forEach((e) => {
+      if (e.hotelId === h.id) keepPayer[e.hotelDate] = e.payerId;
+    });
+    const others = trip.expenses.filter((e) => e.hotelId !== h.id);
+    const rebuilt = desired.map((d) => ({
+      id: uid(),
+      payerId: keepPayer[d.hotelDate] || trip.members[0]?.id || "",
+      ...d,
+    }));
+
+    save({
+      ...trip,
+      hotels: trip.hotels.map((x) => (x.id === h.id ? { ...x, sentToSettlement: true } : x)),
+      expenses: [...others, ...rebuilt],
+    });
+  };
+
+  return (
+    <div className="space-y-4">
+      <Btn onClick={addHotel}>
+        <Plus size={15} /> ホテルを追加
+      </Btn>
+      {trip.hotels.length === 0 && <Empty text="ホテルはまだ登録されていません" />}
+      {trip.hotels.map((h) => {
+        const nights = datesBetween(h.checkIn, h.checkOut);
+        return (
+        <Card key={h.id}>
+          <div className="flex justify-between items-start mb-2">
+            <TextInput
+              placeholder="ホテル名"
+              value={h.name}
+              onChange={(e) => update(h.id, { name: e.target.value })}
+              className="font-medium"
+            />
+            <IconBtn danger onClick={() => remove(h.id)} title="削除" />
+          </div>
+          <div className="grid grid-cols-2 gap-3 mt-2">
+            <Field label="チェックイン">
+              <TextInput type="date" value={h.checkIn} onChange={(e) => update(h.id, { checkIn: e.target.value })} />
+            </Field>
+            <Field label="チェックアウト">
+              <TextInput type="date" value={h.checkOut} onChange={(e) => update(h.id, { checkOut: e.target.value })} />
+            </Field>
+          </div>
+          <Field label="住所">
+            <TextInput
+              placeholder="住所"
+              value={h.address || ""}
+              onChange={(e) => update(h.id, { address: e.target.value })}
+            />
+          </Field>
+          <div className="grid grid-cols-2 gap-3">
+            <Field label="電話番号">
+              <TextInput
+                placeholder="+82-..."
+                value={h.phone || ""}
+                onChange={(e) => update(h.id, { phone: e.target.value })}
+              />
+            </Field>
+            <Field label={nights.length > 0 ? "ホテル代（合計・自動計算）" : "ホテル代（合計・ウォン）"}>
+              {nights.length > 0 ? (
+                <div
+                  className="w-full rounded-lg px-3 py-2 text-sm"
+                  style={{ ...inputStyle, color: C.inkSoft, fontFamily: "'Quicksand', monospace" }}
+                >
+                  ₩{nightlyTotal(h, nights).toLocaleString()}
+                </div>
+              ) : (
+                <MoneyInput value={h.priceKrw || ""} onChange={(v) => update(h.id, { priceKrw: v })} />
+              )}
+            </Field>
+          </div>
+          <Field label="地図リンク">
+            <TextInput
+              placeholder="https://..."
+              value={h.mapLink}
+              onChange={(e) => update(h.id, { mapLink: e.target.value })}
+            />
+          </Field>
+          {h.mapLink && (
+            <a
+              href={h.mapLink}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="inline-flex items-center gap-1 text-xs font-medium mb-2 -mt-1"
+              style={{ color: C.teal }}
+            >
+              地図を開く <ExternalLink size={12} />
+            </a>
+          )}
+          <Field label="URL">
+            <TextInput
+              placeholder="https://..."
+              value={h.bookingLink || ""}
+              onChange={(e) => update(h.id, { bookingLink: e.target.value })}
+            />
+          </Field>
+          {h.bookingLink && (
+            <a
+              href={h.bookingLink}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="inline-flex items-center gap-1 text-xs font-medium mb-2 -mt-1"
+              style={{ color: C.persimmon }}
+            >
+              予約ページを開く <ExternalLink size={12} />
+            </a>
+          )}
+          <Field label="メモ">
+            <textarea
+              value={h.memo || ""}
+              onChange={(e) => update(h.id, { memo: e.target.value })}
+              rows={2}
+              placeholder="部屋タイプ、朝食有無など"
+              className="w-full rounded-xl px-3 py-2 text-sm outline-none resize-none"
+              style={{ background: "white", color: C.ink, border: `1px solid ${C.line}` }}
+            />
+          </Field>
+
+          {nights.length > 0 && trip.members.length > 0 && (
+            <div className="mt-3">
+              <div className="text-xs font-medium mb-2" style={{ color: C.inkSoft }}>
+                宿泊メンバーと金額（日ごと）
+              </div>
+              <div className="space-y-2">
+                {nights.map((date) => {
+                  const staying = h.nightlyMembers?.[date] ?? trip.members.map((m) => m.id);
+                  return (
+                    <div key={date} className="rounded-xl p-2" style={{ background: C.cream }}>
+                      <div className="flex items-center gap-2 mb-1.5">
+                        <span
+                          className="text-xs w-16 shrink-0"
+                          style={{ color: C.inkSoft, fontFamily: "'Quicksand', monospace" }}
+                        >
+                          {fmtDateWithWeekday(date)}
+                        </span>
+                        <div className="flex items-center gap-1 flex-1">
+                          <span className="text-xs" style={{ color: C.inkSoft }}>₩</span>
+                          <input
+                            type="text"
+                            inputMode="numeric"
+                            placeholder="0"
+                            value={h.nightlyPrices?.[date] ? Number(h.nightlyPrices[date]).toLocaleString("en-US") : ""}
+                            onChange={(e) => updateNightlyPrice(h, date, e.target.value.replace(/[^0-9]/g, ""))}
+                            className="w-24 rounded-lg px-2 py-1 text-xs outline-none"
+                            style={{ background: "white", color: C.ink, border: `1px solid ${C.line}`, fontFamily: "'Quicksand', monospace" }}
+                          />
+                        </div>
+                      </div>
+                      <div className="flex flex-wrap gap-1.5">
+                        {trip.members.map((m) => (
+                          <button
+                            key={m.id}
+                            onClick={() => toggleNightlyMember(h, date, m.id)}
+                            className="text-xs px-2 py-1 rounded-full"
+                            style={
+                              staying.includes(m.id)
+                                ? { background: C.persimmon, color: "white" }
+                                : { background: "white", color: C.inkSoft, border: `1px solid ${C.line}` }
+                            }
+                          >
+                            {m.emoji || "😀"} {m.name}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          )}
+
+          {(nights.length > 0 ? nightlyTotal(h, nights) > 0 : h.priceKrw) && (
+            <div className="mt-3">
+              <Btn
+                variant="ghost"
+                onClick={() => sendToSettlement(h, nights)}
+              >
+                <Wallet size={14} /> {h.sentToSettlement ? "精算を最新の内容に更新する" : "精算に追加する"}
+              </Btn>
+            </div>
+          )}
+        </Card>
+        );
+      })}
+    </div>
+  );
+}
+
+// 地図リンクのG / Nアイコンボタン
+function MapLinkBadge({ href, kind }) {
+  if (!href) return null;
+  const isG = kind === "google";
+  return (
+    <a
+      href={href}
+      target="_blank"
+      rel="noopener noreferrer"
+      className="inline-flex items-center justify-center rounded-full text-xs font-bold"
+      style={{
+        width: 22,
+        height: 22,
+        background: isG ? "#4285F4" : "#03C75A",
+        color: "white",
+      }}
+      title={isG ? "Googleマップを開く" : "NAVERマップを開く"}
+    >
+      {isG ? "G" : "N"}
+    </a>
+  );
+}
+
+// 2つの予定の間に「経路」ボタンを出す（両方にGoogleマップリンクがある時だけ）
+function RouteBetween({ from, to }) {
+  if (!from.mapLinkGoogle || !to.mapLinkGoogle) return null;
+  const url = `https://www.google.com/maps/dir/?api=1&origin=${encodeURIComponent(
+    from.title
+  )}&destination=${encodeURIComponent(to.title)}&travelmode=transit`;
+  return (
+    <div className="flex items-center justify-center py-1">
+      <a
+        href={url}
+        target="_blank"
+        rel="noopener noreferrer"
+        className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-medium"
+        style={{ background: C.cream, color: C.inkSoft, border: `1px dashed ${C.line}` }}
+      >
+        ↓ <MapPin size={11} /> 🚃 電車の経路・所要時間を見る
+      </a>
+    </div>
+  );
+}
+
+// ---------- Schedule ----------
+function ScheduleTab({ trip, save, myId }) {
+  const update = (id, patch) =>
+    save({ ...trip, schedule: trip.schedule.map((s) => (s.id === id ? { ...s, ...patch } : s)) });
+  const remove = (id) => save({ ...trip, schedule: trip.schedule.filter((s) => s.id !== id) });
+  const toggleMember = (item, mid) => {
+    const has = item.memberIds.includes(mid);
+    update(item.id, { memberIds: has ? item.memberIds.filter((x) => x !== mid) : [...item.memberIds, mid] });
+  };
+
+  const sorted = [...trip.schedule].sort((a, b) => {
+    const d = (a.date || "").localeCompare(b.date || "");
+    if (d !== 0) return d;
+    return (a.time || "").localeCompare(b.time || "");
+  });
+
+  const uniqueDates = [...new Set(sorted.map((s) => s.date).filter(Boolean))].sort();
+  const hasUndated = sorted.some((s) => !s.date);
+  const [activeDate, setActiveDate] = useState(uniqueDates[0] || (hasUndated ? "" : null));
+
+  useEffect(() => {
+    if (activeDate !== null && activeDate !== "" && !uniqueDates.includes(activeDate)) {
+      setActiveDate(uniqueDates[0] || (hasUndated ? "" : null));
+    }
+    // eslint-disable-next-line
+  }, [trip.schedule.length]);
+
+  const visible =
+    activeDate === null
+      ? sorted
+      : sorted.filter((s) => (activeDate === "" ? !s.date : s.date === activeDate));
+
+  const [memberFilter, setMemberFilter] = useState([]); // 複数選択（空＝全員）
+  const toggleMemberFilter = (mid) =>
+    setMemberFilter((f) => (f.includes(mid) ? f.filter((x) => x !== mid) : [...f, mid]));
+  const [categoryFilter, setCategoryFilter] = useState("");
+  const finalVisible = visible
+    .filter((s) => memberFilter.length === 0 || s.memberIds.some((id) => memberFilter.includes(id)))
+    .filter((s) => !categoryFilter || s.category === categoryFilter);
+
+  const [viewMode, setViewMode] = useState("simple"); // simple | detail
+
+  const [showAddForm, setShowAddForm] = useState(false);
+  const emptyDraft = () => ({
+    date: activeDate || "",
+    time: "",
+    title: "",
+    category: "",
+    note: "",
+    mapLinkGoogle: "",
+    mapLinkNaver: "",
+    url: "",
+    memberIds: memberFilter,
+  });
+  const [draft, setDraft] = useState(emptyDraft);
+  const patchDraft = (patch) => setDraft((d) => ({ ...d, ...patch }));
+  const toggleDraftMember = (mid) => {
+    const has = draft.memberIds.includes(mid);
+    patchDraft({ memberIds: has ? draft.memberIds.filter((x) => x !== mid) : [...draft.memberIds, mid] });
+  };
+  const startAdd = () => {
+    setDraft(emptyDraft());
+    setShowAddForm(true);
+  };
+  const cancelAdd = () => setShowAddForm(false);
+  const submitAdd = () => {
+    if (!draft.title.trim()) return;
+    save({ ...trip, schedule: [...trip.schedule, { id: uid(), ...draft, title: draft.title.trim() }] });
+    setShowAddForm(false);
+  };
+
+  return (
+    <div className="space-y-4">
+      <div className="flex gap-2">
+        <button
+          onClick={() => setViewMode("simple")}
+          className="flex-1 py-2 rounded-full text-sm font-medium"
+          style={
+            viewMode === "simple"
+              ? { background: C.persimmon, color: "white" }
+              : { background: C.cream, color: C.inkSoft, border: `1px solid ${C.line}` }
+          }
+        >
+          一覧
+        </button>
+        <button
+          onClick={() => setViewMode("detail")}
+          className="flex-1 py-2 rounded-full text-sm font-medium"
+          style={
+            viewMode === "detail"
+              ? { background: C.persimmon, color: "white" }
+              : { background: C.cream, color: C.inkSoft, border: `1px solid ${C.line}` }
+          }
+        >
+          編集
+        </button>
+      </div>
+
+      {!showAddForm && (
+        <Btn onClick={startAdd}>
+          <Plus size={15} /> 予定を追加
+        </Btn>
+      )}
+
+      {trip.members.length > 0 && (
+        <div className="flex flex-wrap gap-1.5">
+          <button
+            onClick={() => setMemberFilter([])}
+            className="px-2.5 py-1 rounded-full text-xs font-medium"
+            style={
+              memberFilter.length === 0
+                ? { background: C.night, color: "white" }
+                : { background: C.cream, color: C.inkSoft, border: `1px solid ${C.line}` }
+            }
+          >
+            全員
+          </button>
+          {trip.members.map((m) => (
+            <button
+              key={m.id}
+              onClick={() => toggleMemberFilter(m.id)}
+              className="px-2.5 py-1 rounded-full text-xs font-medium"
+              style={
+                memberFilter.includes(m.id)
+                  ? { background: C.teal, color: "white" }
+                  : { background: C.cream, color: C.inkSoft, border: `1px solid ${C.line}` }
+              }
+            >
+              {m.emoji || "😀"} {m.name}
+            </button>
+          ))}
+        </div>
+      )}
+
+      <div className="flex flex-wrap gap-1.5">
+        <button
+          onClick={() => setCategoryFilter("")}
+          className="px-2.5 py-1 rounded-full text-xs font-medium"
+          style={
+            categoryFilter === ""
+              ? { background: C.night, color: "white" }
+              : { background: C.cream, color: C.inkSoft, border: `1px solid ${C.line}` }
+          }
+        >
+          カテゴリ全部
+        </button>
+        {WISHLIST_CATEGORIES.map((c) => (
+          <button
+            key={c.id}
+            onClick={() => setCategoryFilter(categoryFilter === c.id ? "" : c.id)}
+            className="px-2.5 py-1 rounded-full text-xs font-medium"
+            style={
+              categoryFilter === c.id
+                ? { background: c.color, color: "white" }
+                : { background: C.cream, color: C.inkSoft, border: `1px solid ${C.line}` }
+            }
+          >
+            {c.label}
+          </button>
+        ))}
+      </div>
+
+      {(uniqueDates.length > 0 || hasUndated) && (
+        <div className="flex gap-1.5 overflow-x-auto pb-1 -mx-4 px-4">
+          {uniqueDates.map((d) => (
+            <button
+              key={d}
+              onClick={() => setActiveDate(d)}
+              className="shrink-0 px-3 py-1.5 rounded-full text-xs font-medium whitespace-nowrap"
+              style={
+                activeDate === d
+                  ? { background: C.persimmon, color: "white" }
+                  : { background: C.cream, color: C.inkSoft, border: `1px solid ${C.line}` }
+              }
+            >
+              {fmtDateWithWeekday(d)}
+            </button>
+          ))}
+          {hasUndated && (
+            <button
+              onClick={() => setActiveDate("")}
+              className="shrink-0 px-3 py-1.5 rounded-full text-xs font-medium whitespace-nowrap"
+              style={
+                activeDate === ""
+                  ? { background: C.persimmon, color: "white" }
+                  : { background: C.cream, color: C.inkSoft, border: `1px solid ${C.line}` }
+              }
+            >
+              日付未定
+            </button>
+          )}
+        </div>
+      )}
+
+      {showAddForm && (
+        <Card style={{ border: `2px dashed ${C.persimmon}` }}>
+          <div className="text-sm font-medium mb-3" style={{ color: C.ink }}>
+            新しい予定
+          </div>
+          <div className="flex gap-2 items-start mb-2">
+            <TextInput type="date" value={draft.date} onChange={(e) => patchDraft({ date: e.target.value })} style={{ maxWidth: 140 }} />
+            <TextInput type="time" value={draft.time} onChange={(e) => patchDraft({ time: e.target.value })} style={{ maxWidth: 100 }} />
+          </div>
+          <TextInput
+            placeholder="予定タイトル（例: 弘大でランチ）"
+            value={draft.title}
+            onChange={(e) => patchDraft({ title: e.target.value })}
+            className="mb-2"
+          />
+          <div className="flex flex-wrap gap-1.5 mb-2">
+            {WISHLIST_CATEGORIES.map((c) => (
+              <button
+                key={c.id}
+                onClick={() => patchDraft({ category: draft.category === c.id ? "" : c.id })}
+                className="px-2.5 py-1 rounded-full text-xs font-medium"
+                style={
+                  draft.category === c.id
+                    ? { background: c.color, color: "white" }
+                    : { background: C.cream, color: C.inkSoft, border: `1px solid ${C.line}` }
+                }
+              >
+                {c.label}
+              </button>
+            ))}
+          </div>
+          <textarea
+            placeholder="メモ"
+            value={draft.note}
+            onChange={(e) => patchDraft({ note: e.target.value })}
+            className="w-full rounded-lg px-3 py-2 text-sm outline-none mb-2"
+            style={{ ...inputStyle, minHeight: 50 }}
+          />
+          <div className="grid grid-cols-2 gap-2 mb-2">
+            <TextInput
+              placeholder="地図リンク（Google）"
+              value={draft.mapLinkGoogle}
+              onChange={(e) => patchDraft({ mapLinkGoogle: e.target.value })}
+            />
+            <TextInput
+              placeholder="地図リンク（NAVER）"
+              value={draft.mapLinkNaver}
+              onChange={(e) => patchDraft({ mapLinkNaver: e.target.value })}
+            />
+          </div>
+          <TextInput
+            placeholder="URL（任意・予約ページや紹介サイトなど）"
+            value={draft.url}
+            onChange={(e) => patchDraft({ url: e.target.value })}
+            className="mb-2"
+          />
+          <div className="text-xs mb-1" style={{ color: C.inkSoft }}>
+            参加メンバー
+          </div>
+          <div className="flex flex-wrap gap-1.5 mb-3">
+            {trip.members.map((m) => {
+              const on = draft.memberIds.includes(m.id);
+              return (
+                <button
+                  key={m.id}
+                  onClick={() => toggleDraftMember(m.id)}
+                  className="px-2.5 py-1 rounded-full text-xs font-medium"
+                  style={on ? { background: C.teal, color: "white" } : { background: C.cream, color: C.inkSoft }}
+                >
+                  {m.emoji || "😀"} {m.name}
+                </button>
+              );
+            })}
+          </div>
+          <div className="flex items-center gap-2">
+            <Btn onClick={submitAdd}>
+              <Check size={14} /> 登録する
+            </Btn>
+            <Btn variant="ghost" onClick={cancelAdd}>
+              キャンセル
+            </Btn>
+          </div>
+        </Card>
+      )}
+
+      {viewMode === "simple" ? (
+        <>
+          {sorted.length === 0 && <Empty text="予定がまだありません" />}
+          {sorted.length > 0 && finalVisible.length === 0 && <Empty text="条件に合う予定がありません" />}
+          <Card className="!p-0 overflow-hidden">
+            {finalVisible.map((s, idx) => (
+              <button
+                key={s.id}
+                onClick={() => setViewMode("detail")}
+                className="w-full flex items-center gap-2 px-4 py-2.5 text-left"
+                style={{
+                  borderBottom: idx < finalVisible.length - 1 ? `1px solid ${C.line}` : "none",
+                }}
+              >
+                <span
+                  className="text-xs shrink-0 w-11"
+                  style={{ color: C.inkSoft, fontFamily: "'Quicksand', monospace" }}
+                >
+                  {s.time || "--:--"}
+                </span>
+                <span className="text-sm flex-1 truncate" style={{ color: C.ink }}>
+                  {s.title || "（無題）"}
+                </span>
+                <span className="flex -space-x-1 shrink-0">
+                  {s.memberIds.map((mid) => {
+                    const m = trip.members.find((mm) => mm.id === mid);
+                    return m ? (
+                      <span
+                        key={mid}
+                        className="w-5 h-5 rounded-full flex items-center justify-center text-[11px]"
+                        style={{ background: C.cream, border: `1px solid ${C.paper}` }}
+                      >
+                        {m.emoji || "😀"}
+                      </span>
+                    ) : null;
+                  })}
+                </span>
+              </button>
+            ))}
+          </Card>
+        </>
+      ) : (
+        <>
+          {sorted.length === 0 && <Empty text="予定がまだありません" />}
+          {sorted.length > 0 && finalVisible.length === 0 && <Empty text="条件に合う予定がありません" />}
+          {finalVisible.map((s, idx) => {
+            return (
+            <React.Fragment key={s.id}>
+            <Card>
+              {s.auto && (
+                <div
+                  className="text-[10px] mb-1.5 inline-block px-2 py-0.5 rounded-full"
+                  style={{ background: C.cream, color: C.inkSoft }}
+                >
+                  ✈️ 登録タブのフライト情報から自動作成
+                </div>
+              )}
+              <div className="flex gap-2 items-start">
+                <TextInput type="date" value={s.date} onChange={(e) => update(s.id, { date: e.target.value })} style={{ maxWidth: 140 }} />
+                <TextInput type="time" value={s.time} onChange={(e) => update(s.id, { time: e.target.value })} style={{ maxWidth: 100 }} />
+                <TextInput
+                  placeholder="予定タイトル（例: 弘大でランチ）"
+                  value={s.title}
+                  onChange={(e) => update(s.id, { title: e.target.value })}
+                />
+                <IconBtn danger onClick={() => remove(s.id)} title="削除" />
+              </div>
+          <div className="flex flex-wrap gap-1.5 mt-2">
+            {WISHLIST_CATEGORIES.map((c) => (
+              <button
+                key={c.id}
+                onClick={() => update(s.id, { category: s.category === c.id ? "" : c.id })}
+                className="px-2 py-0.5 rounded-full text-[11px] font-medium"
+                style={
+                  (s.category || "") === c.id
+                    ? { background: c.color, color: "white" }
+                    : { background: C.cream, color: C.inkSoft, border: `1px solid ${C.line}` }
+                }
+              >
+                {c.label}
+              </button>
+            ))}
+          </div>
+          <div className="flex items-center gap-1.5 flex-wrap mt-1.5">
+            <button
+              onClick={() => {
+                if (!myId) return;
+                const ratings = { ...(s.ratings || {}) };
+                ratings[myId] = ratings[myId] === "good" ? null : "good";
+                update(s.id, { ratings });
+              }}
+              disabled={!myId}
+              className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[11px] font-medium"
+              style={
+                s.ratings?.[myId] === "good"
+                  ? { background: C.teal, color: "white" }
+                  : { background: C.cream, color: C.inkSoft, border: `1px solid ${C.line}`, opacity: myId ? 1 : 0.5 }
+              }
+            >
+              👍 行ってよかった
+              {Object.values(s.ratings || {}).filter((r) => r === "good").length > 0 &&
+                ` ${Object.values(s.ratings || {}).filter((r) => r === "good").length}`}
+            </button>
+            <button
+              onClick={() => {
+                if (!myId) return;
+                const ratings = { ...(s.ratings || {}) };
+                ratings[myId] = ratings[myId] === "bad" ? null : "bad";
+                update(s.id, { ratings });
+              }}
+              disabled={!myId}
+              className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[11px] font-medium"
+              style={
+                s.ratings?.[myId] === "bad"
+                  ? { background: C.persimmon, color: "white" }
+                  : { background: C.cream, color: C.inkSoft, border: `1px solid ${C.line}`, opacity: myId ? 1 : 0.5 }
+              }
+            >
+              🙅 イマイチだった
+              {Object.values(s.ratings || {}).filter((r) => r === "bad").length > 0 &&
+                ` ${Object.values(s.ratings || {}).filter((r) => r === "bad").length}`}
+            </button>
+            {!myId && (
+              <span className="text-[11px]" style={{ color: C.inkSoft }}>
+                （持ち物タブで自分を選ぶと評価できます）
+              </span>
+            )}
+          </div>
+          <div className="mt-2">
+            <textarea
+              placeholder="メモ"
+              value={s.note}
+              onChange={(e) => update(s.id, { note: e.target.value })}
+              className="w-full rounded-lg px-3 py-2 text-sm outline-none"
+              style={{ ...inputStyle, minHeight: 50 }}
+            />
+          </div>
+          <div className="mt-2">
+            <div className="grid grid-cols-2 gap-2 mb-1.5">
+              <TextInput
+                placeholder="地図リンク（Google）"
+                value={s.mapLinkGoogle || ""}
+                onChange={(e) => update(s.id, { mapLinkGoogle: e.target.value })}
+              />
+              <TextInput
+                placeholder="地図リンク（NAVER）"
+                value={s.mapLinkNaver || ""}
+                onChange={(e) => update(s.id, { mapLinkNaver: e.target.value })}
+              />
+            </div>
+            {(s.mapLinkGoogle || s.mapLinkNaver) && (
+              <div className="flex items-center gap-1.5 mb-2">
+                <MapLinkBadge href={s.mapLinkGoogle} kind="google" />
+                <MapLinkBadge href={s.mapLinkNaver} kind="naver" />
+              </div>
+            )}
+            <TextInput
+              placeholder="URL（任意・予約ページや紹介サイトなど）"
+              value={s.url || ""}
+              onChange={(e) => update(s.id, { url: e.target.value })}
+            />
+            {s.url && (
+              <a
+                href={s.url}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="inline-flex items-center gap-1 text-xs font-medium mt-1.5"
+                style={{ color: C.persimmon }}
+              >
+                リンクを開く <ExternalLink size={12} />
+              </a>
+            )}
+          </div>
+          <div className="text-xs mt-2 mb-1" style={{ color: C.inkSoft }}>
+            参加メンバー
+          </div>
+          <div className="flex flex-wrap gap-1.5">
+            {trip.members.map((m) => {
+              const on = s.memberIds.includes(m.id);
+              return (
+                <button
+                  key={m.id}
+                  onClick={() => toggleMember(s, m.id)}
+                  className="px-2.5 py-1 rounded-full text-xs font-medium"
+                  style={on ? { background: C.teal, color: "white" } : { background: C.cream, color: C.inkSoft }}
+                >
+                  {m.emoji || "😀"} {m.name}
+                </button>
+              );
+            })}
+          </div>
+        </Card>
+        {idx < finalVisible.length - 1 && (
+          <RouteBetween from={s} to={finalVisible[idx + 1]} />
+        )}
+        </React.Fragment>
+        );
+          })}
+        </>
+      )}
+    </div>
+  );
+}
+
+// ---------- Money ----------
+function Money({ trip, save, myId, initialView, setTab }) {
+  const [view, setView] = useState(initialView || "detail"); // detail | result
+  const [expanded, setExpanded] = useState({});
+  const toggleExpand = (id) => setExpanded((e) => ({ ...e, [id]: !e[id] }));
+
+  const addExpense = () => {
+    const id = uid();
+    save({
+      ...trip,
+      expenses: [
+        ...trip.expenses,
+        {
+          id,
+          date: "",
+          description: "",
+          payerId: trip.members[0]?.id || "",
+          amountKrw: "",
+          participants: trip.members.map((m) => m.id),
+        },
+      ],
+    });
+    setExpanded((e) => ({ ...e, [id]: true }));
+  };
+  const update = (id, patch) =>
+    save({ ...trip, expenses: trip.expenses.map((e) => (e.id === id ? { ...e, ...patch } : e)) });
+  const remove = (id) => save({ ...trip, expenses: trip.expenses.filter((e) => e.id !== id) });
+  const toggleParticipant = (exp, mid) => {
+    const has = exp.participants.includes(mid);
+    if (has && exp.participants.length <= 1) return; // 割り勘対象を0人にはできない
+    update(exp.id, {
+      participants: has ? exp.participants.filter((x) => x !== mid) : [...exp.participants, mid],
+    });
+  };
+
+  const totalJpy = trip.expenses.reduce((s, e) => s + krwToJpy(e.amountKrw, e.exchangeRate || trip.exchangeRate), 0);
+
+  const balances = trip.members.map((m) => {
+    let paid = 0;
+    let share = 0;
+    trip.expenses.forEach((e) => {
+      const jpy = krwToJpy(e.amountKrw, e.exchangeRate || trip.exchangeRate);
+      if (e.payerId === m.id) paid += jpy;
+      if (e.participants.includes(m.id) && e.participants.length > 0) {
+        share += jpy / e.participants.length;
+      }
+    });
+    return { member: m, paid, share, balance: paid - share };
+  });
+
+  const sortedExpenses = [...trip.expenses].sort((a, b) => (a.date || "").localeCompare(b.date || ""));
+
+  return (
+    <div className="space-y-4">
+      <div className="flex gap-2">
+        <button
+          onClick={() => setView("detail")}
+          className="flex-1 py-2 rounded-full text-sm font-medium"
+          style={
+            view === "detail"
+              ? { background: C.persimmon, color: "white" }
+              : { background: C.cream, color: C.inkSoft, border: `1px solid ${C.line}` }
+          }
+        >
+          明細
+        </button>
+        <button
+          onClick={() => setView("result")}
+          className="flex-1 py-2 rounded-full text-sm font-medium"
+          style={
+            view === "result"
+              ? { background: C.persimmon, color: "white" }
+              : { background: C.cream, color: C.inkSoft, border: `1px solid ${C.line}` }
+          }
+        >
+          結果
+        </button>
+      </div>
+
+      {view === "detail" ? (
+        <>
+          <Card>
+            <div className="text-sm font-medium mb-2" style={{ color: C.ink }}>
+              為替レート
+            </div>
+            <div className="flex items-center gap-2 text-sm">
+              <span style={{ color: C.inkSoft }}>1,000ウォン =</span>
+              <TextInput
+                type="number"
+                value={trip.exchangeRate}
+                onChange={(e) => save({ ...trip, exchangeRate: e.target.value })}
+                style={{ width: 90 }}
+              />
+              <span style={{ color: C.inkSoft }}>円</span>
+            </div>
+          </Card>
+
+          <Btn onClick={addExpense}>
+            <Plus size={15} /> 支出を追加
+          </Btn>
+
+          {trip.expenses.length === 0 && <Empty text="支出はまだありません" />}
+          {sortedExpenses.map((e) => {
+            const open = !!expanded[e.id];
+            const payer = trip.members.find((m) => m.id === e.payerId);
+            return (
+              <Card key={e.id}>
+                <button
+                  onClick={() => toggleExpand(e.id)}
+                  className="w-full flex items-center gap-2 text-left"
+                >
+                  <span className="text-xs shrink-0" style={{ color: C.inkSoft, fontFamily: "'Quicksand', monospace" }}>
+                    {e.date ? e.date.slice(5) : "--/--"}
+                  </span>
+                  <span className="text-sm flex-1 truncate" style={{ color: C.ink }}>
+                    {e.description || "（内容未入力）"}
+                  </span>
+                  {payer && (
+                    <span className="text-xs shrink-0" style={{ color: C.inkSoft }}>
+                      {payer.emoji || "😀"}
+                    </span>
+                  )}
+                  <span
+                    className="text-sm font-semibold shrink-0"
+                    style={{ color: C.ink, fontFamily: "'Quicksand', monospace" }}
+                  >
+                    {e.amountKrw ? yen(krwToJpy(e.amountKrw, e.exchangeRate || trip.exchangeRate)) : "-"}
+                  </span>
+                  <ChevronDown
+                    size={16}
+                    style={{ color: C.inkSoft, transform: open ? "rotate(180deg)" : "none", transition: "transform 200ms" }}
+                  />
+                </button>
+
+                {open && (
+                  <div className="mt-3">
+                    <div className="flex gap-2 mb-2">
+                      <TextInput type="date" value={e.date} onChange={(ev) => update(e.id, { date: ev.target.value })} style={{ maxWidth: 140 }} />
+                      <TextInput
+                        placeholder="内容（例: タクシー代）"
+                        value={e.description}
+                        onChange={(ev) => update(e.id, { description: ev.target.value })}
+                      />
+                      <IconBtn danger onClick={() => remove(e.id)} title="削除" />
+                    </div>
+                    <div className="grid grid-cols-2 gap-3">
+                      <Field label="立て替えた人">
+                        <select
+                          value={e.payerId}
+                          onChange={(ev) => update(e.id, { payerId: ev.target.value })}
+                          className="w-full rounded-lg px-3 py-2 text-sm outline-none"
+                          style={inputStyle}
+                        >
+                          {trip.members.map((m) => (
+                            <option key={m.id} value={m.id}>
+                              {m.emoji || "😀"} {m.name}
+                            </option>
+                          ))}
+                        </select>
+                      </Field>
+                      <Field label="金額（ウォン）">
+                        <MoneyInput value={e.amountKrw} onChange={(v) => update(e.id, { amountKrw: v })} />
+                      </Field>
+                    </div>
+                    <div className="mb-3">
+                      <label className="text-xs" style={{ color: C.inkSoft }}>
+                        このカードのレート（未入力なら共通レート {trip.exchangeRate}円/1,000₩ を使用）
+                      </label>
+                      <div className="flex items-center gap-2 text-sm mt-1">
+                        <span style={{ color: C.inkSoft }}>1,000ウォン =</span>
+                        <TextInput
+                          type="number"
+                          placeholder={String(trip.exchangeRate)}
+                          value={e.exchangeRate || ""}
+                          onChange={(ev) => update(e.id, { exchangeRate: ev.target.value })}
+                          style={{ width: 90 }}
+                        />
+                        <span style={{ color: C.inkSoft }}>円</span>
+                      </div>
+                    </div>
+                    <div className="text-xs mb-1" style={{ color: C.inkSoft }}>
+                      割り勘の対象（＝一緒に使った人）
+                    </div>
+                    <div className="flex flex-wrap gap-1.5">
+                      {trip.members.map((m) => {
+                        const on = e.participants.includes(m.id);
+                        return (
+                          <button
+                            key={m.id}
+                            onClick={() => toggleParticipant(e, m.id)}
+                            className="px-2.5 py-1 rounded-full text-xs font-medium"
+                            style={on ? { background: C.persimmon, color: "white" } : { background: C.cream, color: C.inkSoft }}
+                          >
+                            {m.emoji || "😀"} {m.name}
+                          </button>
+                        );
+                      })}
+                    </div>
+                    {e.amountKrw && (
+                      <div className="text-xs mt-2 text-right" style={{ color: C.teal, fontFamily: "'Quicksand', monospace" }}>
+                        ≈ {yen(krwToJpy(e.amountKrw, trip.exchangeRate))}
+                      </div>
+                    )}
+                  </div>
+                )}
+              </Card>
+            );
+          })}
+        </>
+      ) : (
+        <>
+          <div className="rounded-3xl p-5 text-white" style={{ background: C.night }}>
+            <div className="text-xs tracking-widest mb-1" style={{ color: C.gold }}>
+              TOTAL
+            </div>
+            <div className="text-2xl font-bold" style={{ fontFamily: "'M PLUS Rounded 1c', sans-serif" }}>
+              {yen(totalJpy)}
+            </div>
+          </div>
+
+          {trip.expenses.length === 0 && <Empty text="まだ支出がありません" />}
+
+          {trip.members.length > 0 && trip.expenses.length > 0 && (
+            <Card>
+              <div className="text-sm font-medium mb-3" style={{ color: C.ink }}>
+                精算バランス
+              </div>
+              <div className="space-y-2">
+                {balances.map(({ member, paid, share, balance }) => (
+                  <div key={member.id} className="flex items-center justify-between text-sm">
+                    <span style={{ color: C.ink }}>{member.emoji || "😀"} {member.name}</span>
+                    <span
+                      className="font-semibold"
+                      style={{
+                        color: balance >= 0 ? C.teal : C.persimmon,
+                        fontFamily: "'Quicksand', monospace",
+                      }}
+                    >
+                      {balance >= 0 ? "+" : ""}
+                      {yen(balance)}
+                    </span>
+                  </div>
+                ))}
+              </div>
+              <p className="text-[11px] mt-3" style={{ color: C.inkSoft }}>
+                プラスは「受け取る」、マイナスは「支払う」金額の目安です（各支出の負担対象人数で割り勘）。
+              </p>
+            </Card>
+          )}
+
+          {trip.members.length > 0 && trip.expenses.length > 0 && (
+            <Card>
+              <div className="text-sm font-medium mb-3" style={{ color: C.ink }}>
+                誰が誰にいくら払う？
+              </div>
+              {(() => {
+                const settlements = settleDebts(balances);
+                if (settlements.length === 0) {
+                  return (
+                    <p className="text-sm" style={{ color: C.inkSoft }}>
+                      みんな精算済みです🎉
+                    </p>
+                  );
+                }
+                return (
+                  <div className="space-y-2.5">
+                    {settlements.map((s, i) => (
+                      <div
+                        key={i}
+                        className="flex items-center gap-2 text-sm rounded-xl px-3 py-2.5"
+                        style={{ background: C.cream }}
+                      >
+                        <span className="font-medium" style={{ color: C.ink }}>
+                          {s.from.emoji || "😀"} {s.from.name}
+                        </span>
+                        <span style={{ color: C.inkSoft }}>→</span>
+                        <span className="font-medium" style={{ color: C.ink }}>
+                          {s.to.emoji || "😀"} {s.to.name}
+                        </span>
+                        <span
+                          className="ml-auto font-bold"
+                          style={{ color: C.persimmon, fontFamily: "'Quicksand', monospace" }}
+                        >
+                          {yen(s.amount)}
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+                );
+              })()}
+              <p className="text-[11px] mt-3" style={{ color: C.inkSoft }}>
+                送金の回数が少なくなるように自動で組み合わせています。
+              </p>
+            </Card>
+          )}
+        </>
+      )}
+    </div>
+  );
+}
+
+// ---------- Wishlist ----------
+const WISHLIST_CATEGORIES = [
+  { id: "food", label: "ごはん", color: "#E2572B" },
+  { id: "cafe", label: "カフェ", color: "#D8A94C" },
+  { id: "shopping", label: "買い物", color: "#2E9C8F" },
+  { id: "beauty", label: "美容", color: "#B968A8" },
+  { id: "sight", label: "観光", color: "#3E6DBE" },
+  { id: "other", label: "その他", color: "#6B675C" },
+];
+const categoryInfo = (id) => WISHLIST_CATEGORIES.find((c) => c.id === id) || WISHLIST_CATEGORIES[5];
+
+// ---------- Shopping list ----------
+function ShoppingTab({ trip, save, myId }) {
+  const [name, setName] = useState("");
+  const [showBought, setShowBought] = useState(true);
+  const [filterMemberId, setFilterMemberId] = useState("");
+  const shopping = trip.shopping || [];
+
+  const addItem = () => {
+    if (!name.trim()) return;
+    save({
+      ...trip,
+      shopping: [
+        ...shopping,
+        { id: uid(), name: name.trim(), url: "", memo: "", bought: false, addedBy: myId || null },
+      ],
+    });
+    setName("");
+  };
+  const update = (id, patch) =>
+    save({ ...trip, shopping: shopping.map((s) => (s.id === id ? { ...s, ...patch } : s)) });
+  const remove = (id) => save({ ...trip, shopping: shopping.filter((s) => s.id !== id) });
+  const memberById = (id) => trip.members.find((m) => m.id === id);
+
+  const visible = shopping
+    .filter((s) => showBought || !s.bought)
+    .filter((s) => !filterMemberId || s.addedBy === filterMemberId);
+  const boughtCount = shopping.filter((s) => s.bought).length;
+
+  return (
+    <div className="space-y-4">
+      <Card>
+        <div className="text-sm font-medium mb-3" style={{ color: C.ink }}>
+          買いたいもの
+        </div>
+        <div className="flex gap-2">
+          <TextInput
+            placeholder="商品名（例: マスクパック）"
+            value={name}
+            onChange={(e) => setName(e.target.value)}
+            onKeyDown={(e) => e.key === "Enter" && addItem()}
+          />
+          <Btn onClick={addItem}>
+            <Plus size={15} />
+          </Btn>
+        </div>
+      </Card>
+
+      {trip.members.length > 0 && (
+        <div className="flex flex-wrap gap-1.5">
+          <button
+            onClick={() => setFilterMemberId("")}
+            className="px-2.5 py-1 rounded-full text-xs font-medium"
+            style={
+              filterMemberId === ""
+                ? { background: C.night, color: "white" }
+                : { background: C.cream, color: C.inkSoft, border: `1px solid ${C.line}` }
+            }
+          >
+            全員
+          </button>
+          {trip.members.map((m) => (
+            <button
+              key={m.id}
+              onClick={() => setFilterMemberId(filterMemberId === m.id ? "" : m.id)}
+              className="px-2.5 py-1 rounded-full text-xs font-medium"
+              style={
+                filterMemberId === m.id
+                  ? { background: C.teal, color: "white" }
+                  : { background: C.cream, color: C.inkSoft, border: `1px solid ${C.line}` }
+              }
+            >
+              {m.emoji || "😀"} {m.name}
+            </button>
+          ))}
+        </div>
+      )}
+
+      {shopping.length > 0 && (
+        <button
+          onClick={() => setShowBought((v) => !v)}
+          className="text-xs px-2.5 py-1 rounded-full font-medium inline-flex items-center gap-1"
+          style={{ background: C.cream, color: C.inkSoft, border: `1px solid ${C.line}` }}
+        >
+          {showBought ? "購入済みを隠す" : `購入済みを表示（${boughtCount}）`}
+        </button>
+      )}
+
+      {shopping.length === 0 && <Empty text="まだ何もありません" />}
+      {shopping.length > 0 && visible.length === 0 && (
+        <Empty text={filterMemberId ? "このメンバーが追加したものはありません" : "まだ買っていないものはありません🎉"} />
+      )}
+
+      <div className="space-y-2">
+        {visible.map((s) => {
+          const adder = s.addedBy ? memberById(s.addedBy) : null;
+          return (
+            <Card key={s.id} className="!py-3">
+              <div className="flex items-start gap-2.5">
+                <button
+                  onClick={() => update(s.id, { bought: !s.bought })}
+                  className="w-6 h-6 rounded-full flex items-center justify-center shrink-0 mt-0.5"
+                  style={{
+                    background: s.bought ? C.teal : "white",
+                    border: `1px solid ${s.bought ? C.teal : C.line}`,
+                  }}
+                  title={s.bought ? "未購入に戻す" : "購入済みにする"}
+                >
+                  {s.bought && <Check size={13} color="white" />}
+                </button>
+                <div className="flex-1 min-w-0">
+                  <div className="flex items-center gap-1.5">
+                    {adder && (
+                      <span className="text-sm shrink-0" title={adder.name}>
+                        {adder.emoji || "😀"}
+                      </span>
+                    )}
+                    <input
+                      value={s.name}
+                      onChange={(e) => update(s.id, { name: e.target.value })}
+                      className="text-sm flex-1 bg-transparent outline-none"
+                      style={{
+                        color: C.ink,
+                        textDecoration: s.bought ? "line-through" : "none",
+                        opacity: s.bought ? 0.5 : 1,
+                      }}
+                    />
+                  </div>
+                  <input
+                    placeholder="商品リンク（任意）"
+                    value={s.url || ""}
+                    onChange={(e) => update(s.id, { url: e.target.value })}
+                    className="text-xs w-full bg-transparent outline-none mt-1"
+                    style={{ color: C.inkSoft }}
+                  />
+                  {s.url && (
+                    <a
+                      href={s.url}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="inline-flex items-center gap-1 text-xs font-medium mt-1"
+                      style={{ color: C.persimmon }}
+                    >
+                      リンクを開く <ExternalLink size={11} />
+                    </a>
+                  )}
+                </div>
+                <IconBtn danger onClick={() => remove(s.id)} title="削除" />
+              </div>
+            </Card>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+function Wishlist({ trip, save }) {
+  if (trip.members.length === 0) return <Empty text="先にメンバーを登録してください" />;
+
+  const addPlace = (memberId) => {
+    const list = trip.wishlist[memberId] || [];
+    save({
+      ...trip,
+      wishlist: { ...trip.wishlist, [memberId]: [...list, { id: uid(), name: "", mapLink: "", url: "", category: "food", memo: "", mustGo: false }] },
+    });
+  };
+  const update = (memberId, placeId, patch) => {
+    const list = (trip.wishlist[memberId] || []).map((p) => (p.id === placeId ? { ...p, ...patch } : p));
+    save({ ...trip, wishlist: { ...trip.wishlist, [memberId]: list } });
+  };
+  const remove = (memberId, placeId) => {
+    const list = (trip.wishlist[memberId] || []).filter((p) => p.id !== placeId);
+    save({ ...trip, wishlist: { ...trip.wishlist, [memberId]: list } });
+  };
+  const addToSchedule = (memberId, place) => {
+    const newItem = {
+      id: uid(),
+      date: "",
+      time: "",
+      title: place.name || "(名称未設定)",
+      note: place.memo || "",
+      mapLinkGoogle: place.mapLink || "",
+      url: place.url || "",
+      category: place.category || "food",
+      memberIds: [memberId],
+    };
+    const list = (trip.wishlist[memberId] || []).map((pp) =>
+      pp.id === place.id ? { ...pp, addedToScheduleId: newItem.id } : pp
+    );
+    save({
+      ...trip,
+      schedule: [...trip.schedule, newItem],
+      wishlist: { ...trip.wishlist, [memberId]: list },
+    });
+  };
+  const removeFromSchedule = (memberId, place) => {
+    const list = (trip.wishlist[memberId] || []).map((pp) =>
+      pp.id === place.id ? { ...pp, addedToScheduleId: null } : pp
+    );
+    save({
+      ...trip,
+      schedule: trip.schedule.filter((s) => s.id !== place.addedToScheduleId),
+      wishlist: { ...trip.wishlist, [memberId]: list },
+    });
+  };
+
+  const [search, setSearch] = useState("");
+  const [categoryFilter, setCategoryFilter] = useState("");
+  const [memberFilter, setMemberFilter] = useState("");
+  const [mustGoOnly, setMustGoOnly] = useState(false);
+  const filterActive = search.trim() !== "" || categoryFilter !== "" || memberFilter !== "" || mustGoOnly;
+
+  const matches = (p) => {
+    if (mustGoOnly && !p.mustGo) return false;
+    if (categoryFilter && (p.category || "food") !== categoryFilter) return false;
+    if (search.trim() && !p.name.toLowerCase().includes(search.trim().toLowerCase())) return false;
+    return true;
+  };
+
+  return (
+    <div className="space-y-4">
+      <Card>
+        <TextInput
+          placeholder="場所の名前で検索"
+          value={search}
+          onChange={(e) => setSearch(e.target.value)}
+        />
+        <button
+          onClick={() => setMustGoOnly((v) => !v)}
+          className="mt-2.5 inline-flex items-center gap-1 px-2.5 py-1 rounded-full text-xs font-medium"
+          style={
+            mustGoOnly
+              ? { background: C.gold, color: C.night }
+              : { background: C.cream, color: C.inkSoft, border: `1px solid ${C.line}` }
+          }
+        >
+          <Star size={12} fill={mustGoOnly ? C.night : "none"} /> 絶対行きたい
+        </button>
+        <p className="text-[11px] mt-1.5" style={{ color: C.inkSoft }}>
+          ⭐各場所の左上の星をタップすると「絶対行きたい」に登録できます
+        </p>
+        <p className="text-[11px] mt-1" style={{ color: C.inkSoft }}>
+          📅 各場所の「行程に追加」ボタンで、スケジュールに予定として登録できます
+        </p>
+        <div className="flex flex-wrap gap-1.5 mt-2.5">
+          <button
+            onClick={() => setCategoryFilter("")}
+            className="px-2.5 py-1 rounded-full text-xs font-medium"
+            style={
+              categoryFilter === ""
+                ? { background: C.night, color: "white" }
+                : { background: C.cream, color: C.inkSoft, border: `1px solid ${C.line}` }
+            }
+          >
+            すべて
+          </button>
+          {WISHLIST_CATEGORIES.map((c) => (
+            <button
+              key={c.id}
+              onClick={() => setCategoryFilter(categoryFilter === c.id ? "" : c.id)}
+              className="px-2.5 py-1 rounded-full text-xs font-medium"
+              style={
+                categoryFilter === c.id
+                  ? { background: c.color, color: "white" }
+                  : { background: C.cream, color: C.inkSoft, border: `1px solid ${C.line}` }
+              }
+            >
+              {c.label}
+            </button>
+          ))}
+        </div>
+        <div className="flex flex-wrap gap-1.5 mt-2">
+          <button
+            onClick={() => setMemberFilter("")}
+            className="px-2.5 py-1 rounded-full text-xs font-medium"
+            style={
+              memberFilter === ""
+                ? { background: C.night, color: "white" }
+                : { background: C.cream, color: C.inkSoft, border: `1px solid ${C.line}` }
+            }
+          >
+            全員
+          </button>
+          {trip.members.map((m) => (
+            <button
+              key={m.id}
+              onClick={() => setMemberFilter(memberFilter === m.id ? "" : m.id)}
+              className="px-2.5 py-1 rounded-full text-xs font-medium"
+              style={
+                memberFilter === m.id
+                  ? { background: C.persimmon, color: "white" }
+                  : { background: C.cream, color: C.inkSoft, border: `1px solid ${C.line}` }
+              }
+            >
+              {m.emoji || "😀"} {m.name}
+            </button>
+          ))}
+        </div>
+      </Card>
+
+      {trip.members
+        .filter((m) => memberFilter === "" || memberFilter === m.id)
+        .map((m) => {
+        const all = trip.wishlist[m.id] || [];
+        const list = filterActive ? all.filter(matches) : all;
+        if (filterActive && list.length === 0) return null;
+        return (
+          <Card key={m.id}>
+            <div className="flex items-center justify-between mb-3">
+              <span className="text-sm font-semibold" style={{ color: C.ink }}>
+                {m.emoji || "😀"} {m.name} の行きたい場所
+              </span>
+              <Btn variant="ghost" onClick={() => addPlace(m.id)}>
+                <Plus size={14} /> 追加
+              </Btn>
+            </div>
+            {list.length === 0 && <Empty text="まだ登録なし" />}
+            <div className="space-y-3">
+              {list.map((p) => {
+                const cat = categoryInfo(p.category);
+                return (
+                  <div
+                    key={p.id}
+                    className="rounded-xl p-3"
+                    style={
+                      p.mustGo
+                        ? { background: "#FBF0DC", border: `1px solid ${C.gold}` }
+                        : { background: C.cream }
+                    }
+                  >
+                    <div className="flex items-center gap-2 mb-2">
+                      <button
+                        onClick={() => update(m.id, p.id, { mustGo: !p.mustGo })}
+                        className="shrink-0"
+                        title={p.mustGo ? "絶対行きたいを解除" : "絶対行きたいに追加"}
+                      >
+                        <Star
+                          size={18}
+                          color={C.gold}
+                          fill={p.mustGo ? C.gold : "none"}
+                        />
+                      </button>
+                      <MapPin size={14} color={cat.color} className="shrink-0" />
+                      <TextInput
+                        placeholder="場所名"
+                        value={p.name}
+                        onChange={(e) => update(m.id, p.id, { name: e.target.value })}
+                      />
+                      <IconBtn danger onClick={() => remove(m.id, p.id)} title="削除" />
+                    </div>
+                    <div className="flex flex-wrap gap-1.5 mb-2">
+                      {WISHLIST_CATEGORIES.map((c) => {
+                        const on = (p.category || "food") === c.id;
+                        return (
+                          <button
+                            key={c.id}
+                            onClick={() => update(m.id, p.id, { category: c.id })}
+                            className="px-2.5 py-1 rounded-full text-xs font-medium"
+                            style={on ? { background: c.color, color: "white" } : { background: "white", color: C.inkSoft, border: `1px solid ${C.line}` }}
+                          >
+                            {c.label}
+                          </button>
+                        );
+                      })}
+                    </div>
+                    <textarea
+                      placeholder="メモ（何が売ってる・何が食べたい等）"
+                      value={p.memo || ""}
+                      onChange={(e) => update(m.id, p.id, { memo: e.target.value })}
+                      className="w-full rounded-lg px-3 py-2 text-sm outline-none mb-2"
+                      style={{ ...inputStyle, minHeight: 44 }}
+                    />
+                    <TextInput
+                      placeholder="地図リンク"
+                      value={p.mapLink}
+                      onChange={(e) => update(m.id, p.id, { mapLink: e.target.value })}
+                    />
+                    {p.mapLink && (
+                      <a
+                        href={p.mapLink}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="inline-flex items-center gap-1 text-xs font-medium mt-1.5 mb-2"
+                        style={{ color: C.teal }}
+                      >
+                        地図を開く <ExternalLink size={12} />
+                      </a>
+                    )}
+                    <TextInput
+                      placeholder="URL（紹介記事・予約ページなど）"
+                      value={p.url || ""}
+                      onChange={(e) => update(m.id, p.id, { url: e.target.value })}
+                    />
+                    {p.url && (
+                      <a
+                        href={p.url}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="inline-flex items-center gap-1 text-xs font-medium mt-1.5"
+                        style={{ color: C.persimmon }}
+                      >
+                        リンクを開く <ExternalLink size={12} />
+                      </a>
+                    )}
+                    <div className="mt-2">
+                      {p.addedToScheduleId ? (
+                        <button
+                          onClick={() => removeFromSchedule(m.id, p)}
+                          className="inline-flex items-center gap-1 text-xs font-medium px-2.5 py-1 rounded-full"
+                          style={{ background: C.teal, color: "white" }}
+                        >
+                          <Check size={12} /> 行程に追加済み（取り消す）
+                        </button>
+                      ) : (
+                        <button
+                          onClick={() => addToSchedule(m.id, p)}
+                          className="inline-flex items-center gap-1 text-xs font-medium px-2.5 py-1 rounded-full"
+                          style={{ background: "white", color: C.persimmon, border: `1px solid ${C.persimmon}` }}
+                        >
+                          <CalendarDays size={12} /> 行程に追加
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          </Card>
+        );
+      })}
+      {filterActive &&
+        trip.members
+          .filter((m) => memberFilter === "" || memberFilter === m.id)
+          .every((m) => (trip.wishlist[m.id] || []).filter(matches).length === 0) && (
+          <Empty text="条件に合う場所が見つかりませんでした" />
+        )}
+    </div>
+  );
+}
+
+// ---------- Packing & Reflection ----------
+const PACKING_CATEGORIES = [
+  { id: "entry", label: "必須" },
+  { id: "general", label: "持ち物" },
+];
+const ENTRY_PRESETS = ["パスポート", "航空券（eチケット）"];
+
+// ホームで選んだ「自分」の状態を表示する小さな帯（持ち物・まとめタブ用）
+function MeIndicator({ trip, myId, setTab }) {
+  const me = trip.members.find((m) => m.id === myId);
+  return (
+    <div
+      className="flex items-center justify-between rounded-2xl px-3.5 py-2.5"
+      style={{ background: C.cream, border: `1px solid ${C.line}` }}
+    >
+      <span className="text-sm" style={{ color: C.ink }}>
+        {me ? (
+          <>
+            {me.emoji || "😀"} <b>{me.name}</b> として操作中
+          </>
+        ) : (
+          "自分が誰か、まだ選ばれていません"
+        )}
+      </span>
+      {setTab && (
+        <button
+          onClick={() => setTab("home")}
+          className="text-xs px-2.5 py-1 rounded-full font-medium"
+          style={{ background: "white", color: C.persimmon, border: `1px solid ${C.line}` }}
+        >
+          {me ? "変更する" : "ホームで選ぶ"}
+        </button>
+      )}
+    </div>
+  );
+}
+
+function Packing({ trip, save, myId, setMyId, setTab }) {
+  const [text, setText] = useState("");
+  const [category, setCategory] = useState("general");
+  const [dupHint, setDupHint] = useState("");
+  const [filterMemberId, setFilterMemberId] = useState("");
+  const [personalView, setPersonalView] = useState(true);
+
+  const chooseMyId = (id) => setMyId(id);
+
+  const addItem = (t = text, cat = category) => {
+    if (!t.trim()) return;
+    const norm = t.trim().toLowerCase();
+    const existing = trip.packing.find(
+      (p) => (p.category || "general") === cat && p.text.trim().toLowerCase() === norm
+    );
+    if (existing) {
+      // already on the list — just check it off for myself instead of duplicating
+      if (myId) {
+        const checkedBy = { ...(existing.checkedBy || {}), [myId]: true };
+        save({ ...trip, packing: trip.packing.map((p) => (p.id === existing.id ? { ...p, checkedBy } : p)) });
+        setDupHint(`「${existing.text}」はもうリストにあったので、自分の分にチェックをつけました`);
+      } else {
+        setDupHint(`「${existing.text}」はもうリストにあります（上の「あなたは誰？」を選ぶとチェックできます）`);
+      }
+      setTimeout(() => setDupHint(""), 3000);
+      setText("");
+      return;
+    }
+    save({
+      ...trip,
+      packing: [...trip.packing, { id: uid(), text: t.trim(), category: cat, addedBy: myId || null, checkedBy: {}, claimedBy: {} }],
+    });
+    setText("");
+  };
+  const toggleMine = (item) => {
+    if (!myId) return;
+    const checkedBy = { ...(item.checkedBy || {}) };
+    checkedBy[myId] = !checkedBy[myId];
+    save({ ...trip, packing: trip.packing.map((p) => (p.id === item.id ? { ...p, checkedBy } : p)) });
+  };
+  const toggleClaim = (item) => {
+    if (!myId) return;
+    const claimedBy = { ...(item.claimedBy || {}) };
+    claimedBy[myId] = !claimedBy[myId];
+    save({ ...trip, packing: trip.packing.map((p) => (p.id === item.id ? { ...p, claimedBy } : p)) });
+  };
+  const remove = (id) => save({ ...trip, packing: trip.packing.filter((p) => p.id !== id) });
+  const memberById = (id) => trip.members.find((m) => m.id === id);
+
+  return (
+    <div className="space-y-4">
+      {trip.members.length > 0 && <MeIndicator trip={trip} myId={myId} setTab={setTab} />}
+
+      {trip.members.length > 0 && (
+        <Card>
+          <div className="text-sm font-medium mb-2" style={{ color: C.ink }}>
+            アイコンで絞り込み
+          </div>
+          <div className="flex flex-wrap gap-1.5">
+            <button
+              onClick={() => setFilterMemberId("")}
+              className="px-2.5 py-1 rounded-full text-xs font-medium"
+              style={
+                filterMemberId === ""
+                  ? { background: C.night, color: "white" }
+                  : { background: C.cream, color: C.inkSoft, border: `1px solid ${C.line}` }
+              }
+            >
+              全部
+            </button>
+            {trip.members.map((m) => (
+              <button
+                key={m.id}
+                onClick={() => setFilterMemberId(filterMemberId === m.id ? "" : m.id)}
+                className="w-9 h-9 rounded-full flex items-center justify-center text-lg"
+                style={
+                  filterMemberId === m.id
+                    ? { background: C.teal }
+                    : { background: "white", border: `1px solid ${C.line}` }
+                }
+                title={`${m.name}がまだ持っていないものだけ表示`}
+              >
+                {m.emoji || "😀"}
+              </button>
+            ))}
+          </div>
+          {filterMemberId && (
+            <p className="text-[11px] mt-2" style={{ color: C.inkSoft }}>
+              {memberById(filterMemberId)?.name} さんがまだチェックしていないものだけ表示しています
+            </p>
+          )}
+        </Card>
+      )}
+
+      {PACKING_CATEGORIES.map((cat) => {
+        const isPersonalCat = cat.id === "general";
+        const showOnlyMine = isPersonalCat && personalView && myId;
+        const items = trip.packing
+          .filter((p) => (p.category || "general") === cat.id)
+          .filter((p) => !filterMemberId || !p.checkedBy?.[filterMemberId])
+          .filter((p) => !showOnlyMine || p.addedBy === myId || p.claimedBy?.[myId] || p.checkedBy?.[myId]);
+        return (
+          <Card key={cat.id}>
+            <div className="flex items-center justify-between mb-3">
+              <div className="text-sm font-medium" style={{ color: C.ink }}>
+                {cat.label}
+              </div>
+              {isPersonalCat && myId && (
+                <div className="flex gap-1">
+                  <button
+                    onClick={() => setPersonalView(true)}
+                    className="text-xs px-2 py-1 rounded-full font-medium"
+                    style={
+                      personalView
+                        ? { background: C.persimmon, color: "white" }
+                        : { background: C.cream, color: C.inkSoft }
+                    }
+                  >
+                    自分の持ち物
+                  </button>
+                  <button
+                    onClick={() => setPersonalView(false)}
+                    className="text-xs px-2 py-1 rounded-full font-medium"
+                    style={
+                      !personalView
+                        ? { background: C.persimmon, color: "white" }
+                        : { background: C.cream, color: C.inkSoft }
+                    }
+                  >
+                    みんなの持ち物
+                  </button>
+                </div>
+              )}
+            </div>
+            <div className="flex gap-2 mb-2">
+              <TextInput
+                placeholder={`${cat.label}を追加`}
+                value={category === cat.id ? text : ""}
+                onFocus={() => setCategory(cat.id)}
+                onChange={(e) => {
+                  setCategory(cat.id);
+                  setText(e.target.value);
+                }}
+                onKeyDown={(e) => e.key === "Enter" && addItem(text, cat.id)}
+              />
+              <Btn onClick={() => addItem(text, cat.id)}>
+                <Plus size={15} />
+              </Btn>
+            </div>
+            {dupHint && category === cat.id && (
+              <div className="text-xs mb-2 px-2.5 py-1.5 rounded-lg" style={{ background: C.cream, color: C.persimmon }}>
+                {dupHint}
+              </div>
+            )}
+            {cat.id === "entry" && (
+              <div className="flex flex-wrap gap-1.5 mb-3">
+                {ENTRY_PRESETS.filter((preset) => !items.some((it) => it.text === preset)).map((preset) => (
+                  <button
+                    key={preset}
+                    onClick={() => addItem(preset, "entry")}
+                    className="text-xs px-2.5 py-1 rounded-full inline-flex items-center gap-1"
+                    style={{ border: `1px dashed ${C.inkSoft}`, color: C.inkSoft }}
+                  >
+                    <Plus size={11} /> {preset}
+                  </button>
+                ))}
+              </div>
+            )}
+            {items.length === 0 && (
+              <Empty text={showOnlyMine ? "自分で追加した持ち物はまだありません" : "まだ何もありません"} />
+            )}
+            <div className="space-y-2">
+              {items.map((p) => {
+                const adder = p.addedBy ? memberById(p.addedBy) : null;
+                const checkedBy = p.checkedBy || {};
+                const myDone = myId ? !!checkedBy[myId] : false;
+                return (
+                  <div key={p.id} className="rounded-xl p-2.5" style={{ background: C.cream }}>
+                    <div className="flex items-center gap-2">
+                      {showOnlyMine ? (
+                        <button
+                          onClick={() => toggleMine(p)}
+                          disabled={!myId}
+                          className="w-6 h-6 rounded-full flex items-center justify-center shrink-0"
+                          style={{
+                            background: myDone ? C.teal : "white",
+                            border: `1px solid ${C.persimmon}`,
+                          }}
+                          title="持った"
+                        >
+                          {myDone && <Check size={13} color="white" />}
+                        </button>
+                      ) : (
+                        adder && (
+                          <span className="text-sm shrink-0" title={adder.name}>
+                            {adder.emoji || "😀"}
+                          </span>
+                        )
+                      )}
+                      <span
+                        className="text-sm flex-1"
+                        style={{ color: C.ink, textDecoration: showOnlyMine && myDone ? "line-through" : "none", opacity: showOnlyMine && myDone ? 0.5 : 1 }}
+                      >
+                        {p.text}
+                      </span>
+                      <IconBtn danger onClick={() => remove(p.id)} title="削除" />
+                    </div>
+                    {!showOnlyMine && (
+                      <div className="flex flex-wrap gap-1 mt-1.5">
+                        {trip.members.map((m) => {
+                          const claimed = !!(p.claimedBy || {})[m.id];
+                          const packed = !!checkedBy[m.id];
+                          const mine = m.id === myId;
+                          return (
+                            <button
+                              key={m.id}
+                              onClick={() => mine && toggleClaim(p)}
+                              disabled={!mine}
+                              title={
+                                mine
+                                  ? claimed
+                                    ? "自分のリストから外す"
+                                    : "自分も欲しい・要る"
+                                  : `${m.name}（見るだけ）`
+                              }
+                              className="relative w-6 h-6 rounded-full flex items-center justify-center text-xs"
+                              style={{
+                                background: claimed ? C.persimmon : "white",
+                                border: `1px solid ${mine ? C.persimmon : C.line}`,
+                                opacity: mine ? 1 : 0.55,
+                                cursor: mine ? "pointer" : "default",
+                              }}
+                            >
+                              {m.emoji || "😀"}
+                              {packed && (
+                                <span
+                                  className="absolute -top-1 -right-1 w-3 h-3 rounded-full flex items-center justify-center"
+                                  style={{ background: C.teal }}
+                                >
+                                  <Check size={8} color="white" />
+                                </span>
+                              )}
+                            </button>
+                          );
+                        })}
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+          </Card>
+        );
+      })}
+    </div>
+  );
+}
+
+function Summary({ trip, save, myId, setMyId, setTab }) {
+  return (
+    <div className="space-y-4">
+      {trip.members.length > 0 && <MeIndicator trip={trip} myId={myId} setTab={setTab} />}
+
+      {(trip.schedule.some((s) => Object.values(s.ratings || {}).includes("good")) ||
+        trip.schedule.some((s) => Object.values(s.ratings || {}).includes("bad"))) && (
+        <Card>
+          <div className="text-sm font-medium mb-3" style={{ color: C.ink }}>
+            旅のまとめ
+          </div>
+          {trip.schedule.some((s) => Object.values(s.ratings || {}).includes("good")) && (
+            <div className="mb-3">
+              <div className="text-xs font-medium mb-1.5" style={{ color: C.teal }}>
+                👍 行ってよかった
+              </div>
+              <div className="flex flex-wrap gap-1.5">
+                {trip.schedule
+                  .filter((s) => Object.values(s.ratings || {}).includes("good"))
+                  .map((s) => (
+                    <span
+                      key={s.id}
+                      className="text-xs px-2.5 py-1 rounded-full"
+                      style={{ background: C.cream, color: C.ink, border: `1px solid ${C.line}` }}
+                    >
+                      {s.title || "（無題）"}（{Object.values(s.ratings).filter((r) => r === "good").length}）
+                    </span>
+                  ))}
+              </div>
+            </div>
+          )}
+          {trip.schedule.some((s) => Object.values(s.ratings || {}).includes("bad")) && (
+            <div>
+              <div className="text-xs font-medium mb-1.5" style={{ color: C.persimmon }}>
+                🙅 イマイチだった
+              </div>
+              <div className="flex flex-wrap gap-1.5">
+                {trip.schedule
+                  .filter((s) => Object.values(s.ratings || {}).includes("bad"))
+                  .map((s) => (
+                    <span
+                      key={s.id}
+                      className="text-xs px-2.5 py-1 rounded-full"
+                      style={{ background: C.cream, color: C.ink, border: `1px solid ${C.line}` }}
+                    >
+                      {s.title || "（無題）"}（{Object.values(s.ratings).filter((r) => r === "bad").length}）
+                    </span>
+                  ))}
+              </div>
+            </div>
+          )}
+        </Card>
+      )}
+
+      <Card>
+        <div className="text-sm font-medium mb-2" style={{ color: C.ink }}>
+          旅の反省・来年へのメモ
+        </div>
+        {trip.reflection.length > 0 && (
+          <div className="space-y-2 mb-3">
+            {trip.reflection.map((r) => {
+              const author = trip.members.find((m) => m.id === r.authorId);
+              return (
+                <div key={r.id} className="rounded-xl p-2.5 flex items-start gap-2" style={{ background: C.cream }}>
+                  <span className="text-sm shrink-0" title={author?.name || r.authorName}>
+                    {author?.emoji || r.authorEmoji || "🙂"}
+                  </span>
+                  <p className="text-sm whitespace-pre-wrap flex-1" style={{ color: C.ink }}>
+                    {r.text}
+                  </p>
+                  <IconBtn
+                    danger
+                    onClick={() =>
+                      save({ ...trip, reflection: trip.reflection.filter((x) => x.id !== r.id) })
+                    }
+                    title="削除"
+                  />
+                </div>
+              );
+            })}
+          </div>
+        )}
+        <ReflectionComposer myId={myId} trip={trip} save={save} />
+      </Card>
+    </div>
+  );
+}
+
+function ReflectionComposer({ myId, trip, save }) {
+  const [draft, setDraft] = useState("");
+  const submit = () => {
+    if (!draft.trim()) return;
+    const author = trip.members.find((m) => m.id === myId);
+    save({
+      ...trip,
+      reflection: [
+        ...trip.reflection,
+        {
+          id: uid(),
+          authorId: myId || null,
+          authorName: author?.name || "",
+          authorEmoji: author?.emoji || "",
+          text: draft.trim(),
+          date: new Date().toISOString().slice(0, 10),
+        },
+      ],
+    });
+    setDraft("");
+  };
+  return (
+    <div>
+      <textarea
+        value={draft}
+        onChange={(e) => setDraft(e.target.value)}
+        placeholder={myId ? "良かったこと、次は改善したいことなど" : "上の「あなたは誰？」で自分を選ぶと、書いた人が分かるようになります"}
+        className="w-full rounded-lg px-3 py-2 text-sm outline-none"
+        style={{ ...inputStyle, minHeight: 90 }}
+      />
+      <div className="mt-2">
+        <Btn onClick={submit}>
+          <Plus size={15} /> メモを追加
+        </Btn>
+      </div>
+    </div>
+  );
+}
+
+
+const root = ReactDOM.createRoot(document.getElementById("root"));
+root.render(
+  <AuthGate>
+    <App />
+  </AuthGate>
+);
+</script>
+</body>
+</html>
