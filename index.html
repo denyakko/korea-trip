@@ -252,50 +252,56 @@ function AuthGate({ children }) {
   const [user, setUser] = React.useState(null);
   const [errorMsg, setErrorMsg] = React.useState("");
   const [creatingGroup, setCreatingGroup] = React.useState(false);
+  const [loggingIn, setLoggingIn] = React.useState(false);
+
+  const resolveGroup = async (u) => {
+    setUser(u);
+    CURRENT_UID = u.uid;
+    try {
+      let groupId = await findMyGroupId(u.uid);
+      const inviteId = getInviteGroupIdFromUrl();
+      if (!groupId && inviteId) {
+        await joinGroup(u.uid, u.email, inviteId);
+        groupId = inviteId;
+      }
+      if (!groupId) {
+        setStatus("needsGroup");
+        return;
+      }
+      CURRENT_GROUP_ID = groupId;
+      setStatus("ready");
+    } catch (e) {
+      console.error(e);
+      setErrorMsg("グループ情報の読み込みに失敗しました。");
+      setStatus("error");
+    }
+  };
 
   React.useEffect(() => {
-    // リダイレクトログインから戻ってきた場合の結果を先に処理
-    auth
-      .getRedirectResult()
-      .catch((e) => {
-        console.error("redirect login failed", e);
-        setErrorMsg("ログインに失敗しました。もう一度お試しください。");
-      })
-      .finally(() => {
-        const unsub = auth.onAuthStateChanged(async (u) => {
-          if (!u) {
-            setUser(null);
-            setStatus("login");
-            return;
-          }
-          setUser(u);
-          CURRENT_UID = u.uid;
-          try {
-            let groupId = await findMyGroupId(u.uid);
-            const inviteId = getInviteGroupIdFromUrl();
-            if (!groupId && inviteId) {
-              await joinGroup(u.uid, u.email, inviteId);
-              groupId = inviteId;
-            }
-            if (!groupId) {
-              setStatus("needsGroup");
-              return;
-            }
-            CURRENT_GROUP_ID = groupId;
-            setStatus("ready");
-          } catch (e) {
-            console.error(e);
-            setErrorMsg("グループ情報の読み込みに失敗しました。");
-            setStatus("error");
-          }
-        });
-        return unsub;
-      });
+    const unsub = auth.onAuthStateChanged((u) => {
+      if (!u) {
+        setUser(null);
+        setStatus("login");
+        return;
+      }
+      resolveGroup(u);
+    });
+    return unsub;
   }, []);
 
-  const handleLogin = () => {
-    const provider = new firebase.auth.GoogleAuthProvider();
-    auth.signInWithRedirect(provider);
+  const handleLogin = async () => {
+    setErrorMsg("");
+    setLoggingIn(true);
+    try {
+      const provider = new firebase.auth.GoogleAuthProvider();
+      await auth.signInWithPopup(provider);
+      // onAuthStateChanged が続きを処理する
+    } catch (e) {
+      console.error("login failed", e);
+      setErrorMsg("ログインに失敗しました（" + (e.code || e.message) + "）。もう一度お試しください。");
+    } finally {
+      setLoggingIn(false);
+    }
   };
 
   const handleCreateGroup = async () => {
@@ -350,10 +356,11 @@ function AuthGate({ children }) {
         )}
         <button
           onClick={handleLogin}
+          disabled={loggingIn}
           className="px-5 py-2.5 rounded-full text-sm font-medium"
           style={{ background: "#DD8E98", color: "white" }}
         >
-          Googleでログイン
+          {loggingIn ? "ログイン中…" : "Googleでログイン"}
         </button>
       </>
     );
