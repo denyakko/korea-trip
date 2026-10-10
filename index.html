@@ -101,37 +101,124 @@ function getInviteGroupIdFromUrl() {
   return params.get("g");
 }
 
-// このユーザーが既にどこかのグループに所属しているか調べる
-async function findMyGroupId(uid) {
+// このユーザーが所属している全グループを調べる（1人が複数グループに入れる）
+async function findMyGroups(uid) {
   const doc = await db.collection("users").doc(uid).get();
-  if (doc.exists) return doc.data().groupId || null;
-  return null;
+  if (!doc.exists) return { groups: [], lastActiveGroupId: null };
+  const data = doc.data();
+  // 旧データ（groupId単体しか持っていない人）も引き続き読める形にしておく
+  if (data.groups) return { groups: data.groups, lastActiveGroupId: data.lastActiveGroupId || null };
+  if (data.groupId) return { groups: [data.groupId], lastActiveGroupId: data.groupId };
+  return { groups: [], lastActiveGroupId: null };
 }
 
-// 招待リンク経由でグループに参加する（初参加の記録を書き込む）
+async function getGroupName(groupId) {
+  try {
+    const doc = await db.collection("groups").doc(groupId).get();
+    return doc.exists ? doc.data().name || "" : "";
+  } catch {
+    return "";
+  }
+}
+
+// 1グループあたりの人数上限（グループごとに追加購入で増やせる）
+const DEFAULT_GROUP_MEMBER_LIMIT = 5;
+
+// 招待リンク／招待コード経由でグループに参加する
 async function joinGroup(uid, email, groupId) {
-  await db.collection("users").doc(uid).set({ groupId, email }, { merge: true });
+  const groupDoc = await db.collection("groups").doc(groupId).get();
+  if (!groupDoc.exists) {
+    throw new Error("そのグループは見つかりませんでした");
+  }
+  const existingMembers = groupDoc.data().members || [];
+  const limit = groupDoc.data().memberLimit || DEFAULT_GROUP_MEMBER_LIMIT;
+  const alreadyIn = existingMembers.some((m) => m.uid === uid);
+  if (!alreadyIn && existingMembers.length >= limit) {
+    throw new Error(`このグループはすでに${limit}人に達しています`);
+  }
+  const { groups } = await findMyGroups(uid);
+  const nextGroups = groups.includes(groupId) ? groups : [...groups, groupId];
+  await db.collection("users").doc(uid).set(
+    { groups: nextGroups, lastActiveGroupId: groupId, email },
+    { merge: true }
+  );
   await db
     .collection("groups")
     .doc(groupId)
     .set(
-      {
-        members: firebase.firestore.FieldValue.arrayUnion({ uid, email }),
-      },
+      { members: firebase.firestore.FieldValue.arrayUnion({ uid, email }) },
       { merge: true }
     );
 }
 
-// 新しいグループを作る（一番最初にアプリを使う人向け）
-async function createGroup(uid, email) {
+// 新しいグループを作る（初めての人にも、すでに他のグループに入っている人にも使える）
+async function createGroup(uid, email, name) {
   const ref = db.collection("groups").doc(); // 自動採番ID
   await ref.set({
+    name: name || "",
     createdAt: firebase.firestore.FieldValue.serverTimestamp(),
     createdBy: uid,
     members: [{ uid, email }],
   });
-  await db.collection("users").doc(uid).set({ groupId: ref.id, email }, { merge: true });
+  const { groups } = await findMyGroups(uid);
+  await db.collection("users").doc(uid).set(
+    { groups: [...groups, ref.id], lastActiveGroupId: ref.id, email },
+    { merge: true }
+  );
   return ref.id;
+}
+
+// このユーザーが「購入済み（グループを新規作成してよい人）」かどうか
+async function isPaidUser(uid) {
+  const doc = await db.collection("paidUsers").doc(uid).get();
+  return doc.exists;
+}
+
+// 合言葉（購入コード）を使って「購入済み」に昇格する。1コード=1人だけ使える
+async function redeemCode(uid, email, code) {
+  const codeRef = db.collection("codes").doc(code.trim());
+  const codeDoc = await codeRef.get();
+  if (!codeDoc.exists) {
+    throw new Error("その合言葉は見つかりませんでした");
+  }
+  if (codeDoc.data().usedBy) {
+    throw new Error("その合言葉はすでに使われています");
+  }
+  await codeRef.set(
+    { usedBy: uid, usedByEmail: email, usedAt: firebase.firestore.FieldValue.serverTimestamp() },
+    { merge: true }
+  );
+  await db.collection("paidUsers").doc(uid).set(
+    { email, unlockedAt: firebase.firestore.FieldValue.serverTimestamp(), viaCode: code.trim() },
+    { merge: true }
+  );
+}
+
+// アクティブなグループを切り替える（データの再取得はせず、次回どれを開くかだけ覚える）
+async function setActiveGroup(uid, groupId) {
+  await db.collection("users").doc(uid).set({ lastActiveGroupId: groupId }, { merge: true });
+}
+
+// 「席追加コード」を使って、そのグループの人数上限を増やす（seatCodesコレクション：{seats: 増える人数}）
+async function redeemSeatCode(groupId, code, uid) {
+  const codeRef = db.collection("seatCodes").doc(code.trim());
+  const codeDoc = await codeRef.get();
+  if (!codeDoc.exists) {
+    throw new Error("その合言葉は見つかりませんでした");
+  }
+  if (codeDoc.data().usedByGroupId) {
+    throw new Error("その合言葉はすでに使われています");
+  }
+  const seats = codeDoc.data().seats || 1;
+  const groupRef = db.collection("groups").doc(groupId);
+  const groupDoc = await groupRef.get();
+  const currentLimit = groupDoc.data().memberLimit || DEFAULT_GROUP_MEMBER_LIMIT;
+  await codeRef.set(
+    { usedByGroupId: groupId, usedByUid: uid, usedAt: firebase.firestore.FieldValue.serverTimestamp() },
+    { merge: true }
+  );
+  await groupRef.set({ memberLimit: currentLimit + seats }, { merge: true });
+  return currentLimit + seats;
 }
 
 </script>
@@ -247,28 +334,51 @@ const ShoppingBag = makeIcon(
 // 中身（旅行アプリ本体）を表示するコンポーネント
 // ============================================================
 
-function AuthGate({ children }) {
+function AuthGate({ children, onGroupsChanged }) {
   const [status, setStatus] = React.useState("checking"); // checking | login | needsGroup | ready | error
   const [user, setUser] = React.useState(null);
   const [errorMsg, setErrorMsg] = React.useState("");
   const [creatingGroup, setCreatingGroup] = React.useState(false);
   const [loggingIn, setLoggingIn] = React.useState(false);
+  const [joinCode, setJoinCode] = React.useState("");
+  const [joining, setJoining] = React.useState(false);
+  const [groupName, setGroupName] = React.useState("");
+  const [myGroups, setMyGroups] = React.useState([]); // [{id, name}]
+  const [isPaid, setIsPaid] = React.useState(null); // null=未確認 | true | false
+  const [redeemInput, setRedeemInput] = React.useState("");
+  const [redeeming, setRedeeming] = React.useState(false);
+
+  const loadMyGroupList = async (uid) => {
+    const { groups } = await findMyGroups(uid);
+    const withNames = await Promise.all(
+      groups.map(async (id) => ({ id, name: (await getGroupName(id)) || "（名前未設定）" }))
+    );
+    setMyGroups(withNames);
+    if (onGroupsChanged) onGroupsChanged(withNames);
+    return withNames;
+  };
 
   const resolveGroup = async (u) => {
     setUser(u);
     CURRENT_UID = u.uid;
     try {
-      let groupId = await findMyGroupId(u.uid);
+      const { groups, lastActiveGroupId } = await findMyGroups(u.uid);
       const inviteId = getInviteGroupIdFromUrl();
-      if (!groupId && inviteId) {
+      let groupId = lastActiveGroupId;
+      if (inviteId && !groups.includes(inviteId)) {
         await joinGroup(u.uid, u.email, inviteId);
         groupId = inviteId;
+      } else if (inviteId) {
+        groupId = inviteId; // 既に入っている招待リンクを開いた＝そのグループに切り替える
       }
+      await loadMyGroupList(u.uid);
+      setIsPaid(await isPaidUser(u.uid));
       if (!groupId) {
         setStatus("needsGroup");
         return;
       }
       CURRENT_GROUP_ID = groupId;
+      await setActiveGroup(u.uid, groupId);
       setStatus("ready");
     } catch (e) {
       console.error(e);
@@ -307,14 +417,53 @@ function AuthGate({ children }) {
   const handleCreateGroup = async () => {
     setCreatingGroup(true);
     try {
-      const groupId = await createGroup(user.uid, user.email);
+      const groupId = await createGroup(user.uid, user.email, groupName.trim());
       CURRENT_GROUP_ID = groupId;
+      await loadMyGroupList(user.uid);
       setStatus("ready");
     } catch (e) {
       console.error(e);
       setErrorMsg("グループの作成に失敗しました。");
     } finally {
       setCreatingGroup(false);
+    }
+  };
+
+  const handleRedeem = async () => {
+    if (!redeemInput.trim()) return;
+    setRedeeming(true);
+    setErrorMsg("");
+    try {
+      await redeemCode(user.uid, user.email, redeemInput);
+      setIsPaid(true);
+      setRedeemInput("");
+    } catch (e) {
+      setErrorMsg(e.message || "合言葉の確認に失敗しました。");
+    } finally {
+      setRedeeming(false);
+    }
+  };
+
+  const handleJoinByCode = async () => {
+    const code = joinCode.trim();
+    if (!code) return;
+    // 招待リンクを丸ごと貼ってもコードだけ貼ってもいいように、両方に対応
+    const match = code.match(/[?&]g=([^&]+)/);
+    const groupId = match ? match[1] : code;
+    setJoining(true);
+    setErrorMsg("");
+    try {
+      await joinGroup(user.uid, user.email, groupId);
+      CURRENT_GROUP_ID = groupId;
+      await setActiveGroup(user.uid, groupId);
+      await loadMyGroupList(user.uid);
+      setJoinCode("");
+      setStatus("ready");
+    } catch (e) {
+      console.error(e);
+      setErrorMsg("そのコードのグループが見つかりませんでした。");
+    } finally {
+      setJoining(false);
     }
   };
 
@@ -372,7 +521,7 @@ function AuthGate({ children }) {
         <h1 className="text-lg font-bold mb-2" style={{ color: "#5C4535" }}>
           まだどのグループにも参加していません
         </h1>
-        <p className="text-sm mb-6" style={{ color: "#A48E7C" }}>
+        <p className="text-sm mb-4" style={{ color: "#A48E7C" }}>
           仲間から届いた招待リンクを開いてログインすると、自動でそのグループに参加します。
           <br />
           まだ誰も旅を始めていない場合は、あなたが新しくグループを作れます。
@@ -382,19 +531,89 @@ function AuthGate({ children }) {
             {errorMsg}
           </p>
         )}
-        <button
-          onClick={handleCreateGroup}
-          disabled={creatingGroup}
-          className="px-5 py-2.5 rounded-full text-sm font-medium"
-          style={{ background: "#DD8E98", color: "white" }}
-        >
-          {creatingGroup ? "作成中…" : "新しくグループを作る"}
-        </button>
+        {isPaid === null ? null : isPaid ? (
+          <>
+            <input
+              value={groupName}
+              onChange={(e) => setGroupName(e.target.value)}
+              placeholder="グループ名（例: 韓国旅行の仲間、任意）"
+              className="w-full rounded-lg px-3 py-2 text-sm outline-none mb-2"
+              style={{ background: "white", border: "1px solid #ECDEC7", color: "#5C4535" }}
+            />
+            <button
+              onClick={handleCreateGroup}
+              disabled={creatingGroup}
+              className="w-full px-5 py-2.5 rounded-full text-sm font-medium mb-4"
+              style={{ background: "#DD8E98", color: "white" }}
+            >
+              {creatingGroup ? "作成中…" : "新しくグループを作る"}
+            </button>
+          </>
+        ) : (
+          <div className="rounded-xl px-3 py-3 mb-4" style={{ background: "#F7F1E8", border: "1px solid #ECDEC7" }}>
+            <p className="text-xs mb-2" style={{ color: "#A48E7C" }}>
+              新しくグループを作るには、合言葉が必要です
+            </p>
+            <div className="flex gap-2">
+              <input
+                value={redeemInput}
+                onChange={(e) => setRedeemInput(e.target.value)}
+                placeholder="合言葉"
+                className="flex-1 rounded-lg px-3 py-2 text-sm outline-none"
+                style={{ background: "white", border: "1px solid #ECDEC7", color: "#5C4535" }}
+              />
+              <button
+                onClick={handleRedeem}
+                disabled={redeeming}
+                className="px-3 py-2 rounded-lg text-sm font-medium shrink-0"
+                style={{ background: "#5C4535", color: "white" }}
+              >
+                {redeeming ? "確認中…" : "使う"}
+              </button>
+            </div>
+          </div>
+        )}
+        <div className="text-xs mb-2" style={{ color: "#A48E7C" }}>
+          または、招待リンク／招待コードを直接貼って参加
+        </div>
+        <div className="flex gap-2">
+          <input
+            value={joinCode}
+            onChange={(e) => setJoinCode(e.target.value)}
+            placeholder="招待リンクまたはコード"
+            className="flex-1 rounded-lg px-3 py-2 text-sm outline-none"
+            style={{ background: "white", border: "1px solid #ECDEC7", color: "#5C4535" }}
+          />
+          <button
+            onClick={handleJoinByCode}
+            disabled={joining}
+            className="px-3 py-2 rounded-lg text-sm font-medium shrink-0"
+            style={{ background: "#8FAE93", color: "white" }}
+          >
+            参加
+          </button>
+        </div>
       </>
     );
   }
 
   // ready
+  window.APP_GROUPS = myGroups;
+  window.APP_SWITCH_GROUP = async (groupId) => {
+    await setActiveGroup(user.uid, groupId);
+    window.location.href = window.location.origin + window.location.pathname; // 招待パラメータも消してリロード
+  };
+  window.APP_CREATE_GROUP = async (name) => {
+    await createGroup(user.uid, user.email, name);
+    window.location.href = window.location.origin + window.location.pathname;
+  };
+  window.APP_JOIN_GROUP = async (codeOrLink) => {
+    const match = codeOrLink.match(/[?&]g=([^&]+)/);
+    const groupId = match ? match[1] : codeOrLink.trim();
+    await joinGroup(user.uid, user.email, groupId);
+    await setActiveGroup(user.uid, groupId);
+    window.location.href = window.location.origin + window.location.pathname;
+  };
   return children;
 }
 
@@ -479,6 +698,13 @@ function onPasteExtractUrl(onChange) {
 function krwToJpy(krw, rate) {
   const n = parseFloat(krw) || 0;
   return (n / 1000) * (parseFloat(rate) || 0);
+}
+// 支出の実際の日本円額：amountJpyを直接入力していればそれを優先、なければウォン×レートで換算
+function expenseJpy(e, trip) {
+  if (e.amountJpy !== undefined && e.amountJpy !== null && e.amountJpy !== "") {
+    return parseFloat(e.amountJpy) || 0;
+  }
+  return krwToJpy(e.amountKrw, e.exchangeRate || trip.exchangeRate);
 }
 const yen = (n) => `¥${Math.round(n).toLocaleString()}`;
 
@@ -1120,7 +1346,159 @@ function YearSettingsModal({
             </div>
           </div>
         )}
+
+        <div className="mt-5 pt-4" style={{ borderTop: `1px solid ${C.line}` }}>
+          <GroupSwitcher />
+        </div>
       </div>
+    </div>
+  );
+}
+
+// グループの一覧表示・切り替え・新規作成・招待コード参加（設定画面の下部に表示）
+function GroupSwitcher() {
+  const [showJoin, setShowJoin] = useState(false);
+  const [showCreate, setShowCreate] = useState(false);
+  const [code, setCode] = useState("");
+  const [newName, setNewName] = useState("");
+  const [isPaid, setIsPaid] = useState(null);
+  const [redeemInput, setRedeemInput] = useState("");
+  const [redeeming, setRedeeming] = useState(false);
+  const [redeemMsg, setRedeemMsg] = useState("");
+  const groups = window.APP_GROUPS || [];
+
+  const checkPaid = () => {
+    isPaidUser(CURRENT_UID).then(setIsPaid);
+  };
+
+  useEffect(() => {
+    if (showCreate && isPaid === null) checkPaid();
+    // eslint-disable-next-line
+  }, [showCreate]);
+
+  const handleRedeem = async () => {
+    if (!redeemInput.trim()) return;
+    setRedeeming(true);
+    setRedeemMsg("");
+    try {
+      await redeemCode(CURRENT_UID, "", redeemInput);
+      setIsPaid(true);
+      setRedeemInput("");
+    } catch (e) {
+      setRedeemMsg(e.message || "合言葉の確認に失敗しました。");
+    } finally {
+      setRedeeming(false);
+    }
+  };
+
+  return (
+    <div>
+      <div className="text-xs font-medium mb-1.5" style={{ color: C.inkSoft }}>
+        グループを切り替え
+      </div>
+      <div className="flex flex-col gap-2 mb-2">
+        {groups.map((g) => (
+          <button
+            key={g.id}
+            onClick={() => window.APP_SWITCH_GROUP(g.id)}
+            className="px-4 py-2.5 rounded-2xl text-sm font-medium text-left"
+            style={
+              g.id === CURRENT_GROUP_ID
+                ? { background: C.night, color: "white" }
+                : { background: C.cream, color: C.ink, border: `1px solid ${C.line}` }
+            }
+          >
+            {g.name}
+          </button>
+        ))}
+      </div>
+
+      {!showCreate && !showJoin && (
+        <div className="flex gap-2">
+          <button
+            onClick={() => setShowCreate(true)}
+            className="flex-1 px-3 py-2 rounded-xl text-xs font-medium"
+            style={{ border: `1px dashed ${C.inkSoft}`, color: C.inkSoft }}
+          >
+            + 新しいグループを作る
+          </button>
+          <button
+            onClick={() => setShowJoin(true)}
+            className="flex-1 px-3 py-2 rounded-xl text-xs font-medium"
+            style={{ border: `1px dashed ${C.inkSoft}`, color: C.inkSoft }}
+          >
+            招待コードで参加
+          </button>
+        </div>
+      )}
+
+      {showCreate && isPaid === false && (
+        <div className="rounded-xl px-3 py-3" style={{ background: C.cream, border: `1px solid ${C.line}` }}>
+          <p className="text-xs mb-2" style={{ color: C.inkSoft }}>
+            新しくグループを作るには、合言葉が必要です
+          </p>
+          {redeemMsg && (
+            <p className="text-xs mb-2" style={{ color: C.persimmon }}>
+              {redeemMsg}
+            </p>
+          )}
+          <div className="flex gap-2">
+            <input
+              value={redeemInput}
+              onChange={(e) => setRedeemInput(e.target.value)}
+              placeholder="合言葉"
+              className="flex-1 rounded-lg px-3 py-2 text-sm outline-none"
+              style={{ background: "white", color: C.ink, border: `1px solid ${C.line}` }}
+            />
+            <button
+              onClick={handleRedeem}
+              disabled={redeeming}
+              className="px-3 py-2 rounded-lg text-sm font-medium shrink-0"
+              style={{ background: C.night, color: "white" }}
+            >
+              {redeeming ? "確認中…" : "使う"}
+            </button>
+          </div>
+        </div>
+      )}
+
+      {showCreate && isPaid === true && (
+        <div className="flex gap-2">
+          <input
+            value={newName}
+            onChange={(e) => setNewName(e.target.value)}
+            placeholder="新しいグループの名前（任意）"
+            className="flex-1 rounded-lg px-3 py-2 text-sm outline-none"
+            style={{ background: "white", color: C.ink, border: `1px solid ${C.line}` }}
+          />
+          <button
+            onClick={() => window.APP_CREATE_GROUP(newName)}
+            className="px-3 py-2 rounded-lg text-sm font-medium"
+            style={{ background: C.persimmon, color: "white" }}
+          >
+            作成
+          </button>
+        </div>
+      )}
+
+      {showJoin && (
+        <div className="flex gap-2">
+          <input
+            value={code}
+            onChange={(e) => setCode(e.target.value)}
+            placeholder="招待リンクまたはコード"
+            className="flex-1 rounded-lg px-3 py-2 text-sm outline-none"
+            style={{ background: "white", color: C.ink, border: `1px solid ${C.line}` }}
+          />
+          <button
+            onClick={() => window.APP_JOIN_GROUP(code)}
+            className="px-3 py-2 rounded-lg text-sm font-medium"
+            style={{ background: C.teal, color: "white" }}
+          >
+            参加
+          </button>
+        </div>
+      )}
     </div>
   );
 }
@@ -1391,12 +1769,12 @@ function Confetti() {
 function Home({ trip, year, setTab, save, prevReflection, myId, onSelectMe, onOpenMoneyResult }) {
   const [showPositionSlider, setShowPositionSlider] = useState(false);
   const totalJpy = trip.expenses.reduce(
-    (s, e) => s + krwToJpy(e.amountKrw, e.exchangeRate || trip.exchangeRate),
+    (s, e) => s + expenseJpy(e, trip),
     0
   );
   const myPaidJpy = trip.expenses
     .filter((e) => e.payerId === myId)
-    .reduce((s, e) => s + krwToJpy(e.amountKrw, e.exchangeRate || trip.exchangeRate), 0);
+    .reduce((s, e) => s + expenseJpy(e, trip), 0);
   const myPaidKrw = trip.expenses
     .filter((e) => e.payerId === myId)
     .reduce((s, e) => s + (parseFloat(e.amountKrw) || 0), 0);
@@ -1813,9 +2191,22 @@ const MEMBER_EMOJIS = ["😀", "😎", "🐶", "🐱", "🐻", "🐰", "🦊", "
 
 // ---------- Registration (members + travel) ----------
 // このグループの招待リンクを表示・コピーできるカード
-function InviteLinkCard() {
+function InviteLinkCard({ trip }) {
   const [copied, setCopied] = useState(false);
+  const [limit, setLimit] = useState(null);
+  const [showSeatForm, setShowSeatForm] = useState(false);
+  const [seatCode, setSeatCode] = useState("");
+  const [redeemingSeats, setRedeemingSeats] = useState(false);
+  const [seatMsg, setSeatMsg] = useState("");
   const inviteLink = `${window.location.origin}${window.location.pathname}?g=${CURRENT_GROUP_ID}`;
+
+  useEffect(() => {
+    db.collection("groups")
+      .doc(CURRENT_GROUP_ID)
+      .get()
+      .then((doc) => setLimit((doc.exists && doc.data().memberLimit) || DEFAULT_GROUP_MEMBER_LIMIT));
+  }, []);
+
   const copy = async () => {
     try {
       await navigator.clipboard.writeText(inviteLink);
@@ -1825,6 +2216,25 @@ function InviteLinkCard() {
       // クリップボードが使えない環境向けに、選択だけでもできるようにする
     }
   };
+
+  const handleRedeemSeats = async () => {
+    if (!seatCode.trim()) return;
+    setRedeemingSeats(true);
+    setSeatMsg("");
+    try {
+      const newLimit = await redeemSeatCode(CURRENT_GROUP_ID, seatCode, CURRENT_UID);
+      setLimit(newLimit);
+      setSeatCode("");
+      setShowSeatForm(false);
+    } catch (e) {
+      setSeatMsg(e.message || "合言葉の確認に失敗しました。");
+    } finally {
+      setRedeemingSeats(false);
+    }
+  };
+
+  const memberCount = trip?.members?.length ?? null;
+
   return (
     <Card>
       <div className="text-sm font-medium mb-1" style={{ color: C.ink }}>
@@ -1843,6 +2253,48 @@ function InviteLinkCard() {
         />
         <Btn onClick={copy}>{copied ? "コピーしました！" : "コピー"}</Btn>
       </div>
+      {limit !== null && (
+        <div className="mt-2 flex items-center justify-between">
+          <span className="text-xs" style={{ color: C.inkSoft }}>
+            グループの人数枠: {memberCount ?? "?"} / {limit}人
+          </span>
+          {!showSeatForm && (
+            <button
+              onClick={() => setShowSeatForm(true)}
+              className="text-xs underline"
+              style={{ color: C.persimmon }}
+            >
+              人数を増やす
+            </button>
+          )}
+        </div>
+      )}
+      {showSeatForm && (
+        <div className="mt-2 rounded-xl p-2.5" style={{ background: C.cream }}>
+          {seatMsg && (
+            <p className="text-xs mb-1.5" style={{ color: C.persimmon }}>
+              {seatMsg}
+            </p>
+          )}
+          <div className="flex gap-2">
+            <input
+              value={seatCode}
+              onChange={(e) => setSeatCode(e.target.value)}
+              placeholder="人数追加の合言葉"
+              className="flex-1 rounded-lg px-3 py-2 text-xs outline-none"
+              style={{ background: "white", color: C.ink, border: `1px solid ${C.line}` }}
+            />
+            <button
+              onClick={handleRedeemSeats}
+              disabled={redeemingSeats}
+              className="px-3 py-2 rounded-lg text-xs font-medium shrink-0"
+              style={{ background: C.night, color: "white" }}
+            >
+              {redeemingSeats ? "確認中…" : "使う"}
+            </button>
+          </div>
+        </div>
+      )}
     </Card>
   );
 }
@@ -1971,7 +2423,7 @@ function Registration({ trip, save }) {
 
   return (
     <div className="space-y-4">
-      <InviteLinkCard />
+      <InviteLinkCard trip={trip} />
       <Card>
         <div className="text-sm font-medium mb-3" style={{ color: C.ink }}>
           メンバーを追加
@@ -2348,7 +2800,7 @@ function HotelTab({ trip, save }) {
               className="inline-flex items-center gap-1 text-xs font-medium mb-2 -mt-1"
               style={{ color: C.persimmon }}
             >
-              ページを開く <ExternalLink size={12} />
+              予約ページを開く <ExternalLink size={12} />
             </a>
           )}
             </>
@@ -2804,16 +3256,17 @@ function ScheduleTab({ trip, save, myId }) {
                   ✈️ 登録タブのフライト情報から自動作成
                 </div>
               )}
-              <div className="flex gap-2 items-start">
+              <div className="flex gap-2 items-start mb-2">
                 <TextInput type="date" value={s.date} onChange={(e) => update(s.id, { date: e.target.value })} style={{ maxWidth: 140 }} />
                 <TextInput type="time" value={s.time} onChange={(e) => update(s.id, { time: e.target.value })} style={{ maxWidth: 100 }} />
-                <TextInput
-                  placeholder="予定タイトル（例: 弘大でランチ）"
-                  value={s.title}
-                  onChange={(e) => update(s.id, { title: e.target.value })}
-                />
                 <IconBtn danger onClick={() => remove(s.id)} title="削除" />
               </div>
+              <TextInput
+                placeholder="予定タイトル（例: 弘大でランチ）"
+                value={s.title}
+                onChange={(e) => update(s.id, { title: e.target.value })}
+                className="mb-2"
+              />
           <div className="flex flex-wrap gap-1.5 mt-2">
             {WISHLIST_CATEGORIES.map((c) => (
               <button
@@ -2988,13 +3441,13 @@ function Money({ trip, save, myId, initialView, setTab }) {
     });
   };
 
-  const totalJpy = trip.expenses.reduce((s, e) => s + krwToJpy(e.amountKrw, e.exchangeRate || trip.exchangeRate), 0);
+  const totalJpy = trip.expenses.reduce((s, e) => s + expenseJpy(e, trip), 0);
 
   const balances = trip.members.map((m) => {
     let paid = 0;
     let share = 0;
     trip.expenses.forEach((e) => {
-      const jpy = krwToJpy(e.amountKrw, e.exchangeRate || trip.exchangeRate);
+      const jpy = expenseJpy(e, trip);
       if (e.payerId === m.id) paid += jpy;
       if (e.participants.includes(m.id) && e.participants.length > 0) {
         share += jpy / e.participants.length;
@@ -3079,7 +3532,7 @@ function Money({ trip, save, myId, initialView, setTab }) {
                     className="text-sm font-semibold shrink-0"
                     style={{ color: C.ink, fontFamily: "'Quicksand', monospace" }}
                   >
-                    {e.amountKrw ? yen(krwToJpy(e.amountKrw, e.exchangeRate || trip.exchangeRate)) : "-"}
+                    {e.amountKrw || e.amountJpy ? yen(expenseJpy(e, trip)) : "-"}
                   </span>
                   <ChevronDown
                     size={16}
@@ -3133,6 +3586,22 @@ function Money({ trip, save, myId, initialView, setTab }) {
                         <span style={{ color: C.inkSoft }}>円</span>
                       </div>
                     </div>
+                    <div className="mb-3 p-2.5 rounded-xl" style={{ background: C.cream }}>
+                      <label className="text-xs" style={{ color: C.inkSoft }}>
+                        実際の日本円の金額（任意・入力するとレート換算より優先されます）
+                      </label>
+                      <div className="flex items-center gap-2 text-sm mt-1">
+                        <span style={{ color: C.inkSoft }}>¥</span>
+                        <MoneyInput
+                          value={e.amountJpy || ""}
+                          onChange={(v) => update(e.id, { amountJpy: v })}
+                          placeholder="例: 80270（カード請求額など）"
+                        />
+                      </div>
+                      <p className="text-[11px] mt-1" style={{ color: C.inkSoft }}>
+                        手数料や割引で計算が合わない場合、カードの請求額などをそのまま入れてください。
+                      </p>
+                    </div>
                     <div className="text-xs mb-1" style={{ color: C.inkSoft }}>
                       割り勘の対象（＝一緒に使った人）
                     </div>
@@ -3151,9 +3620,10 @@ function Money({ trip, save, myId, initialView, setTab }) {
                         );
                       })}
                     </div>
-                    {e.amountKrw && (
+                    {(e.amountKrw || e.amountJpy) && (
                       <div className="text-xs mt-2 text-right" style={{ color: C.teal, fontFamily: "'Quicksand', monospace" }}>
-                        ≈ {yen(krwToJpy(e.amountKrw, trip.exchangeRate))}
+                        {e.amountJpy ? "実額を使用: " : "≈ "}
+                        {yen(expenseJpy(e, trip))}
                       </div>
                     )}
                   </div>
