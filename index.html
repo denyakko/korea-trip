@@ -741,6 +741,7 @@ function settleDebts(balances) {
 function pairwiseSettlements(trip) {
   const EPS = 1;
   const owed = {}; // owed[debtorId][creditorId] = amount
+  const items = {}; // items[debtorId][creditorId] = [{desc,date,amount}]
 
   trip.expenses.forEach((e) => {
     const payerId = e.payerId;
@@ -752,6 +753,9 @@ function pairwiseSettlements(trip) {
       if (pid === payerId) return;
       owed[pid] = owed[pid] || {};
       owed[pid][payerId] = (owed[pid][payerId] || 0) + perPerson;
+      items[pid] = items[pid] || {};
+      items[pid][payerId] = items[pid][payerId] || [];
+      items[pid][payerId].push({ desc: e.description || "（内容未入力）", date: e.date || "", amount: perPerson, total: jpy, count: participants.length });
     });
   });
 
@@ -766,10 +770,12 @@ function pairwiseSettlements(trip) {
       const aOwesB = owed[aId]?.[bId] || 0;
       const bOwesA = owed[bId]?.[aId] || 0;
       const net = aOwesB - bOwesA;
+      const aList = items[aId]?.[bId] || []; // aがbに払う分
+      const bList = items[bId]?.[aId] || []; // bがaに払う分
       if (net > EPS) {
-        result.push({ fromId: aId, toId: bId, amount: net });
+        result.push({ fromId: aId, toId: bId, amount: net, plus: aList, minus: bList });
       } else if (net < -EPS) {
-        result.push({ fromId: bId, toId: aId, amount: -net });
+        result.push({ fromId: bId, toId: aId, amount: -net, plus: bList, minus: aList });
       }
     });
   });
@@ -778,6 +784,8 @@ function pairwiseSettlements(trip) {
     from: trip.members.find((m) => m.id === r.fromId),
     to: trip.members.find((m) => m.id === r.toId),
     amount: r.amount,
+    plus: r.plus,
+    minus: r.minus,
   })).filter((r) => r.from && r.to);
 }
 
@@ -3457,6 +3465,7 @@ function Money({ trip, save, myId, initialView, setTab }) {
   const [view, setView] = useState(initialView || "detail"); // detail | result
   const [expanded, setExpanded] = useState({});
   const toggleExpand = (id) => setExpanded((e) => ({ ...e, [id]: !e[id] }));
+  const [openPair, setOpenPair] = useState({});
 
   const addExpense = () => {
     const id = uid();
@@ -3748,18 +3757,19 @@ function Money({ trip, save, myId, initialView, setTab }) {
                       const key = `${s.from.id}_${s.to.id}`;
                       const done = !!(trip.settledPairs || {})[key];
                       return (
+                        <div key={i} className="rounded-xl" style={{ background: C.cream, opacity: done ? 0.55 : 1 }}>
                         <div
-                          key={i}
-                          className="flex items-center gap-2 text-sm rounded-xl px-3 py-2.5"
-                          style={{ background: done ? C.cream : C.cream, opacity: done ? 0.55 : 1 }}
+                          className="flex items-center gap-2 text-sm px-3 py-2.5 cursor-pointer"
+                          onClick={() => setOpenPair((o) => ({ ...o, [key]: !o[key] }))}
                         >
                           <button
-                            onClick={() =>
+                            onClick={(ev) => {
+                              ev.stopPropagation();
                               save({
                                 ...trip,
                                 settledPairs: { ...(trip.settledPairs || {}), [key]: !done },
-                              })
-                            }
+                              });
+                            }}
                             className="w-6 h-6 rounded-full flex items-center justify-center shrink-0"
                             style={{
                               background: done ? C.teal : "white",
@@ -3792,6 +3802,45 @@ function Money({ trip, save, myId, initialView, setTab }) {
                           >
                             {yen(s.amount)}
                           </span>
+                          <ChevronDown
+                            size={14}
+                            style={{ color: C.inkSoft, transform: openPair[key] ? "rotate(180deg)" : "none", transition: "transform 200ms" }}
+                          />
+                        </div>
+                        {openPair[key] && (
+                          <div className="px-3 pb-3 text-xs" style={{ color: C.ink }}>
+                            <div className="mb-1" style={{ color: C.inkSoft }}>
+                              {s.from.name} が {s.to.name} に払う分
+                            </div>
+                            {s.plus.map((it, k) => (
+                              <div key={k} className="flex items-baseline gap-2 py-0.5">
+                                <span style={{ color: C.inkSoft, fontFamily: "'Quicksand', monospace" }}>{it.date ? it.date.slice(5) : "--/--"}</span>
+                                <span className="flex-1 truncate">{it.desc}</span>
+                                {it.count > 1 && (
+                                  <span style={{ color: C.inkSoft }}>{yen(it.total)}÷{it.count}</span>
+                                )}
+                                <span style={{ fontFamily: "'Quicksand', monospace" }}>{yen(it.amount)}</span>
+                              </div>
+                            ))}
+                            {s.minus.length > 0 && (
+                              <>
+                                <div className="mt-2 mb-1" style={{ color: C.inkSoft }}>
+                                  {s.to.name} が {s.from.name} に払う分（差し引き）
+                                </div>
+                                {s.minus.map((it, k) => (
+                                  <div key={k} className="flex items-baseline gap-2 py-0.5">
+                                    <span style={{ color: C.inkSoft, fontFamily: "'Quicksand', monospace" }}>{it.date ? it.date.slice(5) : "--/--"}</span>
+                                    <span className="flex-1 truncate">{it.desc}</span>
+                                    {it.count > 1 && (
+                                      <span style={{ color: C.inkSoft }}>{yen(it.total)}÷{it.count}</span>
+                                    )}
+                                    <span style={{ fontFamily: "'Quicksand', monospace" }}>-{yen(it.amount)}</span>
+                                  </div>
+                                ))}
+                              </>
+                            )}
+                          </div>
+                        )}
                         </div>
                       );
                     })}
@@ -3799,7 +3848,7 @@ function Money({ trip, save, myId, initialView, setTab }) {
                 );
               })()}
               <p className="text-[11px] mt-3" style={{ color: C.inkSoft }}>
-                実際にその支出を立て替えた人へ直接払う形になっています。左の丸をタップすると「送金済み」を記録できます。
+                実際にその支出を立て替えた人へ直接払う形になっています。左の丸をタップすると「送金済み」を記録でき、行をタップすると内訳が見られます。
               </p>
             </Card>
           )}
