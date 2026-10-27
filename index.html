@@ -735,6 +735,52 @@ function settleDebts(balances) {
   return result;
 }
 
+// 実際に立て替えた人へ直接返す形の精算リストを作る
+// （全体の収支だけでまとめず、各支出の「払った人」ごとに精算する）
+// 例: まりがごはん代を5人分払ったら、他の4人は（りーではなく）まりに払う形になる
+function pairwiseSettlements(trip) {
+  const EPS = 1;
+  const owed = {}; // owed[debtorId][creditorId] = amount
+
+  trip.expenses.forEach((e) => {
+    const payerId = e.payerId;
+    const participants = e.participants || [];
+    if (!payerId || participants.length === 0) return;
+    const jpy = expenseJpy(e, trip);
+    const perPerson = jpy / participants.length;
+    participants.forEach((pid) => {
+      if (pid === payerId) return;
+      owed[pid] = owed[pid] || {};
+      owed[pid][payerId] = (owed[pid][payerId] || 0) + perPerson;
+    });
+  });
+
+  // 同じ2人の間で双方向の貸し借りがあれば相殺する
+  const seen = new Set();
+  const result = [];
+  Object.keys(owed).forEach((aId) => {
+    Object.keys(owed[aId]).forEach((bId) => {
+      const pairKey = [aId, bId].sort().join("|");
+      if (seen.has(pairKey)) return;
+      seen.add(pairKey);
+      const aOwesB = owed[aId]?.[bId] || 0;
+      const bOwesA = owed[bId]?.[aId] || 0;
+      const net = aOwesB - bOwesA;
+      if (net > EPS) {
+        result.push({ fromId: aId, toId: bId, amount: net });
+      } else if (net < -EPS) {
+        result.push({ fromId: bId, toId: aId, amount: -net });
+      }
+    });
+  });
+
+  return result.map((r) => ({
+    from: trip.members.find((m) => m.id === r.fromId),
+    to: trip.members.find((m) => m.id === r.toId),
+    amount: r.amount,
+  })).filter((r) => r.from && r.to);
+}
+
 // ---------- small UI atoms ----------
 function TicketDivider() {
   return (
@@ -3605,6 +3651,15 @@ function Money({ trip, save, myId, initialView, setTab }) {
                     <div className="text-xs mb-1" style={{ color: C.inkSoft }}>
                       割り勘の対象（＝一緒に使った人）
                     </div>
+                    <p className="text-[11px] mb-2 leading-relaxed" style={{ color: C.inkSoft }}>
+                      選んだ人だけで割ります。立て替えた人も一緒に使ったなら、自分も選んでください。
+                      誰かの分だけ立て替えたときは、その人だけを選びます。
+                    </p>
+                    {e.payerId && !e.participants.includes(e.payerId) && (
+                      <p className="text-[11px] mb-2 px-2 py-1.5 rounded-lg" style={{ background: C.cream, color: C.persimmon }}>
+                        ⚠️ 立て替えた人が対象に入っていません（自分は使っていない場合はこのままでOK）
+                      </p>
+                    )}
                     <div className="flex flex-wrap gap-1.5">
                       {trip.members.map((m) => {
                         const on = e.participants.includes(m.id);
@@ -3679,7 +3734,7 @@ function Money({ trip, save, myId, initialView, setTab }) {
                 誰が誰にいくら払う？
               </div>
               {(() => {
-                const settlements = settleDebts(balances);
+                const settlements = pairwiseSettlements(trip);
                 if (settlements.length === 0) {
                   return (
                     <p className="text-sm" style={{ color: C.inkSoft }}>
@@ -3744,7 +3799,7 @@ function Money({ trip, save, myId, initialView, setTab }) {
                 );
               })()}
               <p className="text-[11px] mt-3" style={{ color: C.inkSoft }}>
-                送金の回数が少なくなるように自動で組み合わせています。左の丸をタップすると「送金済み」を記録できます。
+                実際にその支出を立て替えた人へ直接払う形になっています。左の丸をタップすると「送金済み」を記録できます。
               </p>
             </Card>
           )}
